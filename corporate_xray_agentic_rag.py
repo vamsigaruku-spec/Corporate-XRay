@@ -1,31 +1,21 @@
-import os
 import json
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
+import pymupdf
 import requests
 import torch
-import pymupdf
-
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer, CrossEncoder
-
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from transformers import (
-    AutoTokenizer,
     AutoModelForCausalLM,
+    AutoTokenizer,
     BitsAndBytesConfig,
 )
-
-from smolagents import (
-    Model,
-    ChatMessage,
-    MessageRole,
-    ToolCallingAgent,
-    tool,
-)
-
+from smolagents import ChatMessage, MessageRole, Model, ToolCallingAgent, tool
 from smolagents.models import get_tool_json_schema
 
 
@@ -35,125 +25,58 @@ from smolagents.models import get_tool_json_schema
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
-CH_API_URL = (
-    "https://api.company-information.service.gov.uk"
+CH_API_URL = "https://api.company-information.service.gov.uk"
+DOC_API_URL = "https://document-api.company-information.service.gov.uk"
+
+MODEL_ID = os.getenv("CORPORATE_XRAY_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
+EMBEDDING_MODEL_ID = os.getenv(
+    "CORPORATE_XRAY_EMBEDDING_MODEL_ID",
+    "BAAI/bge-small-en-v1.5",
 )
-
-DOC_API_URL = (
-    "https://document-api.company-information.service.gov.uk"
+RERANKER_MODEL_ID = os.getenv(
+    "CORPORATE_XRAY_RERANKER_MODEL_ID",
+    "BAAI/bge-reranker-base",
 )
-
-# Local laptop model
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-
-# CPU RAG models
-EMBEDDING_MODEL_ID = "BAAI/bge-small-en-v1.5"
-RERANKER_MODEL_ID = "BAAI/bge-reranker-base"
-
-
-# ============================================================
-# 2. COMPANIES HOUSE API KEY
-# ============================================================
-
-# ============================================================
-# PASTE YOUR COMPANIES HOUSE API KEY BETWEEN THE QUOTES
-# ============================================================
-
-COLAB_COMPANIES_HOUSE_API_KEY = "13e7d605-cf1c-49f3-a60a-5f7af0f59a41"
+MAX_EVIDENCE_ATTEMPTS = 3
 
 
 def load_dotenv_file():
-    """
-    Load simple KEY=VALUE entries from .env.
-    """
-
+    """Load simple KEY=VALUE pairs from the local .env file."""
     env_path = PROJECT_DIR / ".env"
-
     if not env_path.exists():
         return
 
-    for raw in env_path.read_text(
-        encoding="utf-8"
-    ).splitlines():
-
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
-
-        if (
-            not line
-            or line.startswith("#")
-            or "=" not in line
-        ):
+        if not line or line.startswith("#") or "=" not in line:
             continue
 
-        key, value = line.split(
-            "=",
-            1,
-        )
-
+        key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
 
-        if (
-            len(value) >= 2
-            and value[0] == '"'
-            and value[-1] == '"'
-        ):
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
 
-        elif (
-            len(value) >= 2
-            and value[0] == "'"
-            and value[-1] == "'"
-        ):
-            value = value[1:-1]
-
-        if key and value:
-            os.environ.setdefault(
-                key,
-                value,
-            )
+        if key and value and key not in os.environ:
+            os.environ[key] = value
 
 
 load_dotenv_file()
 
-
-COMPANIES_HOUSE_API_KEY = (
-    os.getenv(
-        "COMPANIES_HOUSE_API_KEY",
-        "",
-    ).strip()
-    or COLAB_COMPANIES_HOUSE_API_KEY.strip()
-)
-
-
-HF_TOKEN = os.getenv(
-    "HF_TOKEN",
-    "",
-).strip()
+COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 
 def require_companies_house_api_key():
-    """
-    Return a valid Companies House API key.
-    """
-
-    key = (
-        os.getenv(
-            "COMPANIES_HOUSE_API_KEY",
-            "",
-        ).strip()
-        or COMPANIES_HOUSE_API_KEY
-    )
-
+    """Return the configured Companies House API key or fail clearly."""
+    key = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip() or COMPANIES_HOUSE_API_KEY
     if not key:
-
         raise RuntimeError(
-            "Companies House API key is missing. "
-            "Set COMPANIES_HOUSE_API_KEY in .env "
-            "or paste it into "
-            "COLAB_COMPANIES_HOUSE_API_KEY."
+            "COMPANIES_HOUSE_API_KEY is missing. "
+            "Create a local .env file or configure the environment variable "
+            "before running Corporate X-Ray."
         )
-
     return key
 
 
@@ -182,39 +105,22 @@ TOOL_NAMES = WORKFLOW[:-1]
 # ============================================================
 
 corporate_xray_state = {
-
-    "current_stage":
-        "company_search",
-
-    "company_search_completed":
-        False,
-
-    "company_profile_completed":
-        False,
-
-    "officers_completed":
-        False,
-
-    "pscs_completed":
-        False,
-
-    "filings_completed":
-        False,
-
-    "charges_completed":
-        False,
-
-    "insolvency_completed":
-        False,
-
-    "evidence_completed":
-        False,
-
-    "selected_company_name":
-        None,
-
-    "selected_company_number":
-        None,
+    "current_stage": "company_search",
+    "company_search_completed": False,
+    "company_profile_completed": False,
+    "officers_completed": False,
+    "pscs_completed": False,
+    "filings_completed": False,
+    "charges_completed": False,
+    "insolvency_completed": False,
+    "evidence_completed": False,
+    "selected_company_name": None,
+    "selected_company_number": None,
+    "investigation_question": "",
+    "default_evidence_query": "",
+    "evidence_attempts": 0,
+    "evidence_queries": [],
+    "started_at": None,
 }
 
 
@@ -286,44 +192,24 @@ _agent = None
 # ============================================================
 
 def reset_corporate_xray_state():
-    """
-    Reset all investigation state and RAG state.
-    """
-
+    """Reset investigation, evidence and telemetry state for a new run."""
     corporate_xray_state.update({
-
-        "current_stage":
-            "company_search",
-
-        "company_search_completed":
-            False,
-
-        "company_profile_completed":
-            False,
-
-        "officers_completed":
-            False,
-
-        "pscs_completed":
-            False,
-
-        "filings_completed":
-            False,
-
-        "charges_completed":
-            False,
-
-        "insolvency_completed":
-            False,
-
-        "evidence_completed":
-            False,
-
-        "selected_company_name":
-            None,
-
-        "selected_company_number":
-            None,
+        "current_stage": "company_search",
+        "company_search_completed": False,
+        "company_profile_completed": False,
+        "officers_completed": False,
+        "pscs_completed": False,
+        "filings_completed": False,
+        "charges_completed": False,
+        "insolvency_completed": False,
+        "evidence_completed": False,
+        "selected_company_name": None,
+        "selected_company_number": None,
+        "investigation_question": "",
+        "default_evidence_query": "",
+        "evidence_attempts": 0,
+        "evidence_queries": [],
+        "started_at": None,
     })
 
     for key in corporate_xray_data:
@@ -341,28 +227,21 @@ def reset_corporate_xray_state():
 # 8. WORKFLOW HELPERS
 # ============================================================
 
-def advance_stage(
-    completed_stage,
-):
-    """
-    Move to the next workflow stage.
-    """
+def advance_stage(completed_stage):
+    """Advance the guarded structured workflow. Evidence remains agent-controlled."""
+    if completed_stage == "search_company_evidence":
+        if corporate_xray_state["evidence_attempts"] >= MAX_EVIDENCE_ATTEMPTS:
+            corporate_xray_state["evidence_completed"] = True
+            corporate_xray_state["current_stage"] = "final_answer"
+        else:
+            corporate_xray_state["current_stage"] = "search_company_evidence"
+        return
 
-    index = WORKFLOW.index(
-        completed_stage
-    )
-
+    index = WORKFLOW.index(completed_stage)
     if index + 1 < len(WORKFLOW):
-
-        corporate_xray_state[
-            "current_stage"
-        ] = WORKFLOW[index + 1]
-
+        corporate_xray_state["current_stage"] = WORKFLOW[index + 1]
     else:
-
-        corporate_xray_state[
-            "current_stage"
-        ] = "final_answer"
+        corporate_xray_state["current_stage"] = "final_answer"
 
 
 def current_company_number():
@@ -1744,129 +1623,46 @@ def hybrid_search(
 # ============================================================
 
 @tool
-def company_search(
-    query: str,
-) -> dict:
-    """
-    Identify the exact legal company in Companies House.
-
-    Args:
-        query: Company name to investigate.
-
-    Returns:
-        Exact selected company identity.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_search"
-    ):
-
+def company_search(query: str = "") -> dict:
+    """Identify the exact legal company in Companies House."""
+    if corporate_xray_state["current_stage"] != "company_search":
         return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
+            "status": "blocked",
+            "required_stage": corporate_xray_state["current_stage"],
         }
 
-    results = search_company_api(
-        query
-    )
+    query = (query or corporate_xray_state.get("selected_company_name") or corporate_xray_state.get("investigation_question") or "").strip()
+    if not query:
+        return {"status": "error", "message": "Company name is required."}
 
-    normalized_query = (
-        query.strip().upper()
-    )
-
+    results = search_company_api(query)
+    normalized_query = query.upper()
     exact_matches = [
-
-        item
-
-        for item
-        in results
-
-        if (
-            item.get(
-                "company_name"
-            )
-            or ""
-        ).strip().upper()
-        == normalized_query
+        item for item in results
+        if (item.get("company_name") or "").strip().upper() == normalized_query
     ]
-
-    exact_matches.sort(
-
-        key=lambda item:
-            item.get(
-                "company_status"
-            )
-            != "active"
-    )
+    exact_matches.sort(key=lambda item: item.get("company_status") != "active")
 
     if not exact_matches:
-
         return {
-
-            "status":
-                "error",
-
-            "message":
-                (
-                    f"Exact company "
-                    f"'{query}' was not found."
-                ),
+            "status": "error",
+            "message": f"Exact company '{query}' was not found.",
         }
 
     selected = exact_matches[0]
-
     corporate_xray_state.update({
-
-        "selected_company_name":
-            selected.get(
-                "company_name"
-            ),
-
-        "selected_company_number":
-            selected.get(
-                "company_number"
-            ),
-
-        "company_search_completed":
-            True,
+        "selected_company_name": selected.get("company_name"),
+        "selected_company_number": selected.get("company_number"),
+        "company_search_completed": True,
     })
-
-    corporate_xray_data[
-        "company_search"
-    ] = results
-
-    advance_stage(
-        "company_search"
-    )
+    corporate_xray_data["company_search"] = results
+    advance_stage("company_search")
 
     return {
-
-        "status":
-            "completed",
-
-        "company_name":
-            selected.get(
-                "company_name"
-            ),
-
-        "company_number":
-            selected.get(
-                "company_number"
-            ),
-
-        "company_status":
-            selected.get(
-                "company_status"
-            ),
+        "status": "completed",
+        "company_name": selected.get("company_name"),
+        "company_number": selected.get("company_number"),
+        "company_status": selected.get("company_status"),
     }
 
 
@@ -2317,157 +2113,102 @@ def company_insolvency() -> dict:
 # ============================================================
 
 @tool
-def search_company_evidence(
-    query: str = "",
-) -> list:
+def search_company_evidence(query: str = "") -> list:
+    """Search official filing documents using hybrid RAG and reranking.
+
+    The tool is intentionally repeatable. The single agent can call it again
+    with a refined query when the first evidence set is insufficient.
     """
-    Search official filing documents with hybrid RAG and reranking.
+    if corporate_xray_state["current_stage"] not in {
+        "search_company_evidence",
+        "final_answer",
+    }:
+        return [{
+            "status": "blocked",
+            "required_stage": corporate_xray_state["current_stage"],
+        }]
 
-    Args:
-        query: Documentary evidence question.
+    if corporate_xray_state["current_stage"] == "final_answer":
+        return [{"status": "blocked", "message": "Evidence search is closed."}]
 
-    Returns:
-        Top ranked documentary evidence.
-    """
+    attempts = corporate_xray_state["evidence_attempts"]
+    if attempts >= MAX_EVIDENCE_ATTEMPTS:
+        corporate_xray_state["evidence_completed"] = True
+        corporate_xray_state["current_stage"] = "final_answer"
+        return [{
+            "status": "limit_reached",
+            "message": "Maximum evidence-search attempts reached.",
+        }]
 
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "search_company_evidence"
-    ):
-
-        return [
-
-            {
-
-                "status":
-                    "blocked",
-
-                "required_stage":
-                    corporate_xray_state[
-                        "current_stage"
-                    ],
-            }
-        ]
-
-    if not query.strip():
-
+    query = (query or "").strip()
+    if not query:
         query = (
-            "recent director appointment "
-            "date of appointment "
-            "official filing evidence"
+            corporate_xray_state.get("default_evidence_query")
+            or "official filing evidence recent company activity"
         )
+
+    corporate_xray_state["evidence_attempts"] += 1
+    corporate_xray_state["evidence_queries"].append(query)
 
     try:
-
-        chunk_count = (
-            ensure_company_rag_index(
-                current_company_number()
-            )
-        )
-
-        if chunk_count:
-
-            evidence = hybrid_search(
-                query
-            )
-
-        else:
-
-            evidence = []
-
+        chunk_count = ensure_company_rag_index(current_company_number())
+        evidence = hybrid_search(query) if chunk_count else []
     except Exception as exc:
-
-        evidence = [
-
-            {
-
-                "status":
-                    "evidence_unavailable",
-
-                "message":
-                    str(exc)[:300],
-            }
-        ]
+        evidence = [{
+            "status": "evidence_unavailable",
+            "message": str(exc)[:300],
+        }]
 
     corporate_xray_evidence.clear()
+    if isinstance(evidence, list):
+        corporate_xray_evidence.extend(evidence)
 
-    if isinstance(
-        evidence,
-        list,
-    ):
+    # Keep the stage open so the agent can decide whether to refine the query.
+    # Only the hard retry cap forces transition to final_answer.
+    if corporate_xray_state["evidence_attempts"] >= MAX_EVIDENCE_ATTEMPTS:
+        corporate_xray_state["evidence_completed"] = True
+        corporate_xray_state["current_stage"] = "final_answer"
+    else:
+        corporate_xray_state["current_stage"] = "search_company_evidence"
 
-        corporate_xray_evidence.extend(
-            evidence
-        )
-
-    corporate_xray_state[
-        "evidence_completed"
-    ] = True
-
-    advance_stage(
-        "search_company_evidence"
-    )
-
-    return corporate_xray_evidence[
-        :3
-    ]
+    return corporate_xray_evidence[:3]
 
 
 # ============================================================
 # 31. FINAL ANSWER VALIDATION
 # ============================================================
 
-def investigation_complete(
-    final_answer,
-    memory,
-    agent=None,
-):
-    """
-    Prevent final_answer until every investigation stage
-    has completed.
-    """
-
+def investigation_complete(final_answer, memory, agent=None):
+    """Reject final answers until structured data and evidence are available."""
     required_flags = [
-
         "company_search_completed",
-
         "company_profile_completed",
-
         "officers_completed",
-
         "pscs_completed",
-
         "filings_completed",
-
         "charges_completed",
-
         "insolvency_completed",
-
-        "evidence_completed",
     ]
-
     missing = [
-
-        key
-
-        for key
-        in required_flags
-
-        if not corporate_xray_state.get(
-            key,
-            False,
-        )
+        key for key in required_flags
+        if not corporate_xray_state.get(key, False)
     ]
 
     if missing:
-
         raise ValueError(
-
-            "Investigation incomplete. "
-            f"Missing steps: {missing}"
+            "Investigation incomplete. Missing steps: " + ", ".join(missing)
         )
+
+    if not corporate_xray_state.get("evidence_attempts", 0):
+        raise ValueError(
+            "FINAL ANSWER REJECTED: documentary evidence search has not been attempted."
+        )
+
+    if not corporate_xray_state.get("evidence_completed"):
+        # The evidence loop can finish by user/agent decision before the hard cap.
+        # A non-empty evidence search is sufficient to permit synthesis; unsupported
+        # claims are handled by the report-generation prompt and evidence metadata.
+        corporate_xray_state["evidence_completed"] = True
 
     return True
 
@@ -2614,112 +2355,65 @@ class LocalQwenModel(Model):
         self,
         generated_text,
     ):
-        """
-        Convert generated output into the only valid call
-        for the current workflow stage.
-        """
-
-        stage = corporate_xray_state[
-            "current_stage"
-        ]
-
-        if stage == "final_answer":
-
-            answer = (
-                generated_text.strip()
-                or
-                "Investigation completed."
-            )
-
-            return {
-
-                "name":
-                    "final_answer",
-
-                "arguments": {
-
-                    "answer":
-                        answer,
-                },
-            }
-
-        # ----------------------------------------------------
-        # Try to parse an actual Qwen tool call first.
-        # ----------------------------------------------------
+        """Parse a Qwen tool call with safe stage-aware fallbacks."""
+        stage = corporate_xray_state["current_stage"]
 
         match = re.search(
-
-            r"<tool_call>\s*"
-            r"(\{.*?\})"
-            r"\s*</tool_call>",
-
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
             generated_text,
-
             re.DOTALL,
         )
 
         if match:
-
             try:
-
-                payload = json.loads(
-                    match.group(1)
-                )
-
-                if (
-                    isinstance(
-                        payload,
-                        dict,
-                    )
-                    and payload.get(
-                        "name"
-                    ) == stage
-                ):
-
-                    arguments = (
-                        payload.get(
-                            "arguments",
-                            {},
-                        )
-                    )
-
-                    if not isinstance(
-                        arguments,
-                        dict,
-                    ):
-
+                payload = json.loads(match.group(1))
+                if isinstance(payload, dict) and payload.get("name"):
+                    name = payload["name"]
+                    arguments = payload.get("arguments", {})
+                    if not isinstance(arguments, dict):
                         arguments = {}
 
-                    return {
+                    valid_names = {stage}
+                    if stage == "search_company_evidence":
+                        valid_names.add("final_answer")
 
-                        "name":
-                            stage,
-
-                        "arguments":
-                            arguments,
-                    }
-
+                    if name in valid_names:
+                        if name == "company_search" and not arguments.get("query"):
+                            arguments["query"] = corporate_xray_state.get("investigation_question", "")
+                        if name == "search_company_evidence" and not arguments.get("query"):
+                            arguments["query"] = corporate_xray_state.get("default_evidence_query", "")
+                        return {"name": name, "arguments": arguments}
             except Exception:
                 pass
 
-        # ----------------------------------------------------
-        # Robust fallback.
-        # ----------------------------------------------------
-        #
-        # Because the workflow controller already knows the
-        # only legal next step, always call that tool.
-        # This is what eliminates the recurring malformed-call
-        # failures we saw earlier.
-        # ----------------------------------------------------
+        if stage == "final_answer":
+            return {
+                "name": "final_answer",
+                "arguments": {
+                    "answer": generated_text.strip() or "Investigation completed.",
+                },
+            }
 
-        return {
+        if stage == "search_company_evidence":
+            if corporate_xray_state.get("evidence_attempts", 0) >= MAX_EVIDENCE_ATTEMPTS:
+                return {
+                    "name": "final_answer",
+                    "arguments": {
+                        "answer": generated_text.strip() or "Investigation completed.",
+                    },
+                }
+            return {
+                "name": "search_company_evidence",
+                "arguments": {
+                    "query": corporate_xray_state.get("default_evidence_query", "")
+                },
+            }
 
-            "name":
-                stage,
+        fallback_args = {}
+        if stage == "company_search":
+            fallback_args["query"] = corporate_xray_state.get("investigation_question", "")
 
-            "arguments":
-                {},
-        }
+        return {"name": stage, "arguments": fallback_args}
 
     def generate(
         self,
@@ -2746,26 +2440,11 @@ class LocalQwenModel(Model):
         )
 
         allowed_tools = []
-
-        for candidate in (
-            tools_to_call_from or []
-        ):
-
+        for candidate in (tools_to_call_from or []):
             if candidate.name == stage:
-
-                allowed_tools.append(
-                    candidate
-                )
-
-            elif (
-                stage == "final_answer"
-                and candidate.name
-                == "final_answer"
-            ):
-
-                allowed_tools.append(
-                    candidate
-                )
+                allowed_tools.append(candidate)
+            elif stage == "search_company_evidence" and candidate.name == "final_answer":
+                allowed_tools.append(candidate)
 
         tool_schemas = [
 
@@ -3422,10 +3101,10 @@ def run_corporate_xray(
         )
 
     reset_corporate_xray_state()
+    corporate_xray_state["investigation_question"] = company_name
+    corporate_xray_state["started_at"] = __import__("time").time()
 
-    agent = (
-        get_corporate_xray_agent()
-    )
+    agent = get_corporate_xray_agent()
 
     prompt = f"""
 Perform a complete Corporate X-Ray investigation of:
@@ -3449,9 +3128,12 @@ Rules:
 - Identify the exact requested UK legal company.
 - Use the exact company number returned by company_search.
 - Never substitute a different company.
-- Complete every investigation stage.
+- Complete every structured investigation stage.
 - Use official Companies House observations.
-- Use retrieved documentary evidence.
+- After structured collection, use search_company_evidence.
+- Evaluate whether the retrieved documentary evidence actually supports the investigative finding.
+- If the evidence is insufficient, reformulate the query and search again.
+- You may perform at most 3 evidence searches.
 - Do not invent facts.
 - Clearly distinguish missing information from confirmed information.
 - Keep the final report factual and evidence-grounded.
