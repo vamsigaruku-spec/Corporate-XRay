@@ -1621,50 +1621,61 @@ def hybrid_search(
 # ============================================================
 # 23. TOOL 1 — COMPANY SEARCH
 # ============================================================
-
 @tool
-def company_search(query: str = "") -> dict:
-    """Identify the exact legal company in Companies House."""
-    if corporate_xray_state["current_stage"] != "company_search":
+def company_search(query: str) -> dict:
+    """
+    Search Companies House for a UK company.
+
+    Args:
+        query: Company name or search term to search on Companies House.
+
+    Returns:
+        The selected company name and company number.
+    """
+    result = search_company(
+        query,
+        items_per_page=10,
+    )
+
+    if not result:
         return {
-            "status": "blocked",
-            "required_stage": corporate_xray_state["current_stage"],
+            "status": "not_found",
+            "message": f"No Companies House result found for '{query}'.",
         }
 
-    query = (query or corporate_xray_state.get("selected_company_name") or corporate_xray_state.get("investigation_question") or "").strip()
-    if not query:
-        return {"status": "error", "message": "Company name is required."}
+    query_normalized = query.strip().upper()
 
-    results = search_company_api(query)
-    normalized_query = query.upper()
-    exact_matches = [
-        item for item in results
-        if (item.get("company_name") or "").strip().upper() == normalized_query
-    ]
-    exact_matches.sort(key=lambda item: item.get("company_status") != "active")
+    exact_matches = []
+    other_matches = []
 
-    if not exact_matches:
-        return {
-            "status": "error",
-            "message": f"Exact company '{query}' was not found.",
-        }
+    for item in result:
+        name = (
+            item.get("company_name") or ""
+        ).strip().upper()
 
-    selected = exact_matches[0]
-    corporate_xray_state.update({
-        "selected_company_name": selected.get("company_name"),
-        "selected_company_number": selected.get("company_number"),
-        "company_search_completed": True,
-    })
-    corporate_xray_data["company_search"] = results
-    advance_stage("company_search")
+        if name == query_normalized:
+            exact_matches.append(item)
+        else:
+            other_matches.append(item)
+
+    exact_matches.sort(
+        key=lambda x: x.get("company_status") != "active"
+    )
+
+    other_matches.sort(
+        key=lambda x: x.get("company_status") != "active"
+    )
+
+    matches = (
+        exact_matches[:3]
+        + other_matches[:2]
+    )
 
     return {
-        "status": "completed",
-        "company_name": selected.get("company_name"),
-        "company_number": selected.get("company_number"),
-        "company_status": selected.get("company_status"),
+        "status": "success",
+        "query": query,
+        "matches": matches,
     }
-
 
 # ============================================================
 # 24. TOOL 2 — COMPANY PROFILE
