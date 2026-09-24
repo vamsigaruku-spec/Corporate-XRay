@@ -2122,67 +2122,99 @@ def company_insolvency() -> dict:
 # ============================================================
 # 30. TOOL 8 — SEARCH DOCUMENTARY EVIDENCE
 # ============================================================
-
 @tool
-def search_company_evidence(query: str = "") -> list:
-    """Search official filing documents using hybrid RAG and reranking.
-
-    The tool is intentionally repeatable. The single agent can call it again
-    with a refined query when the first evidence set is insufficient.
+def search_company_evidence(query: str) -> list:
     """
-    if corporate_xray_state["current_stage"] not in {
-        "search_company_evidence",
-        "final_answer",
-    }:
-        return [{
-            "status": "blocked",
-            "required_stage": corporate_xray_state["current_stage"],
-        }]
+    Search official Companies House filing documents using hybrid RAG
+    and reranking.
 
-    if corporate_xray_state["current_stage"] == "final_answer":
-        return [{"status": "blocked", "message": "Evidence search is closed."}]
+    Args:
+        query: Natural-language question describing the documentary
+            evidence that should be retrieved.
 
-    attempts = corporate_xray_state["evidence_attempts"]
-    if attempts >= MAX_EVIDENCE_ATTEMPTS:
-        corporate_xray_state["evidence_completed"] = True
-        corporate_xray_state["current_stage"] = "final_answer"
-        return [{
-            "status": "limit_reached",
-            "message": "Maximum evidence-search attempts reached.",
-        }]
+    Returns:
+        A list of ranked documentary evidence records.
+    """
+    if (
+        corporate_xray_state["current_stage"]
+        != "search_company_evidence"
+    ):
+        return [
+            {
+                "status": "blocked",
+                "required_stage": corporate_xray_state["current_stage"],
+            }
+        ]
 
-    query = (query or "").strip()
+    query = query.strip()
+
     if not query:
-        query = (
-            corporate_xray_state.get("default_evidence_query")
-            or "official filing evidence recent company activity"
-        )
+        return [
+            {
+                "status": "error",
+                "message": "A documentary evidence query is required.",
+            }
+        ]
 
-    corporate_xray_state["evidence_attempts"] += 1
-    corporate_xray_state["evidence_queries"].append(query)
+    company_number = current_company_number()
+
+    if not company_number:
+        return [
+            {
+                "status": "error",
+                "message": "No company has been selected.",
+            }
+        ]
 
     try:
-        chunk_count = ensure_company_rag_index(current_company_number())
-        evidence = hybrid_search(query) if chunk_count else []
+        chunk_count = ensure_company_rag_index(
+            company_number
+        )
+
+        if not chunk_count:
+            return [
+                {
+                    "status": "no_evidence",
+                    "message": (
+                        "No documentary evidence is available "
+                        "for the selected company."
+                    ),
+                }
+            ]
+
+        evidence = hybrid_search(
+            query,
+            top_k=5,
+            candidate_k=8,
+        )
+
+        reranked = rerank_results(
+            query,
+            evidence,
+            top_k=3,
+        )
+
+        return [
+            {
+                "company_number": company_number,
+                "document_id": item.get("document_id"),
+                "filename": item.get("filename"),
+                "category": item.get("category"),
+                "filing_date": item.get("filing_date"),
+                "page": item.get("page"),
+                "score": item.get("reranker_score"),
+                "evidence": item.get("text", ""),
+            }
+            for item in reranked
+        ]
+
     except Exception as exc:
-        evidence = [{
-            "status": "evidence_unavailable",
-            "message": str(exc)[:300],
-        }]
-
-    corporate_xray_evidence.clear()
-    if isinstance(evidence, list):
-        corporate_xray_evidence.extend(evidence)
-
-    # Keep the stage open so the agent can decide whether to refine the query.
-    # Only the hard retry cap forces transition to final_answer.
-    if corporate_xray_state["evidence_attempts"] >= MAX_EVIDENCE_ATTEMPTS:
-        corporate_xray_state["evidence_completed"] = True
-        corporate_xray_state["current_stage"] = "final_answer"
-    else:
-        corporate_xray_state["current_stage"] = "search_company_evidence"
-
-    return corporate_xray_evidence[:3]
+        return [
+            {
+                "status": "error",
+                "message": f"Evidence retrieval failed: {exc}",
+            }
+        ]
 
 
 # ============================================================
