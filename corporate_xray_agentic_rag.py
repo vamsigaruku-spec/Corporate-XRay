@@ -120,6 +120,7 @@ corporate_xray_state = {
     "default_evidence_query": "",
     "evidence_attempts": 0,
     "evidence_queries": [],
+    "evidence_sufficient": False,
     "started_at": None,
 }
 
@@ -1113,21 +1114,17 @@ def build_company_rag_index(
     }
 
     candidates.sort(
-
         key=lambda item: (
+            0 if item.get("type") in priority_types else 1,
+            item.get("date") or "",
+        ),
+        reverse=False,
+    )
 
-            0
-            if item.get(
-                "type"
-            )
-            in priority_types
-            else 1,
-
-            item.get(
-                "date"
-            )
-            or "",
-        )
+    # Within each priority group, use the most recent filing first.
+    candidates.sort(
+        key=lambda item: item.get("date") or "",
+        reverse=True,
     )
 
     candidates = candidates[
@@ -1632,23 +1629,30 @@ def company_search(query: str) -> dict:
     Returns:
         The selected company name and company number.
     """
-    result = search_company(
-        query,
-        items_per_page=10,
-    )
+    query = str(query).strip()
 
-    if not result:
+    if not query:
+        return {
+            "status": "error",
+            "message": "Company name is required.",
+        }
+
+    # Use the actual Companies House API helper defined above.
+    results = search_company_api(query, limit=10)
+
+    if not results:
         return {
             "status": "not_found",
+            "query": query,
             "message": f"No Companies House result found for '{query}'.",
         }
 
-    query_normalized = query.strip().upper()
+    query_normalized = query.upper()
 
     exact_matches = []
     other_matches = []
 
-    for item in result:
+    for item in results:
         name = (
             item.get("company_name") or ""
         ).strip().upper()
@@ -1658,23 +1662,49 @@ def company_search(query: str) -> dict:
         else:
             other_matches.append(item)
 
+    # Prefer exact active matches, then other active matches.
     exact_matches.sort(
-        key=lambda x: x.get("company_status") != "active"
+        key=lambda item: item.get("company_status") != "active"
     )
-
     other_matches.sort(
-        key=lambda x: x.get("company_status") != "active"
+        key=lambda item: item.get("company_status") != "active"
     )
 
-    matches = (
-        exact_matches[:3]
-        + other_matches[:2]
-    )
+    matches = exact_matches[:3] + other_matches[:2]
+
+    selected = exact_matches[0] if exact_matches else matches[0]
+
+    selected_name = selected.get("company_name")
+    selected_number = selected.get("company_number")
+
+    if not selected_number:
+        return {
+            "status": "error",
+            "query": query,
+            "message": "Companies House returned a result without a company number.",
+            "matches": matches,
+        }
+
+    corporate_xray_state["selected_company_name"] = selected_name
+    corporate_xray_state["selected_company_number"] = selected_number
+    corporate_xray_data["company_search"] = {
+        "query": query,
+        "matches": matches,
+        "selected_company_name": selected_name,
+        "selected_company_number": selected_number,
+    }
+    corporate_xray_state["company_search_completed"] = True
+
+    # Move to the next guarded stage.
+    advance_stage("company_search")
 
     return {
         "status": "success",
         "query": query,
+        "selected_company_name": selected_name,
+        "selected_company_number": selected_number,
         "matches": matches,
+        "next_stage": corporate_xray_state["current_stage"],
     }
 
 # ============================================================
@@ -2135,10 +2165,7 @@ def search_company_evidence(query: str) -> list:
     Returns:
         A list of ranked documentary evidence records.
     """
-    if (
-        corporate_xray_state["current_stage"]
-        != "search_company_evidence"
-    ):
+    if corporate_xray_state["current_stage"] != "search_company_evidence":
         return [
             {
                 "status": "blocked",
@@ -2146,7 +2173,13 @@ def search_company_evidence(query: str) -> list:
             }
         ]
 
-    query = query.strip()
+    query = str(query).strip()
+
+    if not query:
+        query = corporate_xray_state.get(
+            "default_evidence_query",
+            "",
+        ).strip()
 
     if not query:
         return [
@@ -2158,60 +2191,88 @@ def search_company_evidence(query: str) -> list:
 
     company_number = current_company_number()
 
-    if not company_number:
-        return [
-            {
-                "status": "error",
-                "message": "No company has been selected.",
-            }
-        ]
+    attempt = corporate_xray_state.get("evidence_attempts", 0) + 1
+    corporate_xray_state["evidence_attempts"] = attempt
+    corporate_xray_state["evidence_queries"].append(query)
 
     try:
-        chunk_count = ensure_company_rag_index(
-            company_number
-        )
+        chunk_count = ensure_company_rag_index(company_number)
 
         if not chunk_count:
+            corporate_xray_state["evidence_completed"] = True
+            corporate_xray_state["current_stage"] = "final_answer"
             return [
                 {
                     "status": "no_evidence",
+                    "company_number": company_number,
                     "message": (
                         "No documentary evidence is available "
                         "for the selected company."
                     ),
+                    "attempt": attempt,
                 }
             ]
 
-        evidence = hybrid_search(
+        # hybrid_search already performs:
+        # BM25 + dense retrieval + RRF + BGE reranking.
+        results = hybrid_search(
             query,
-            top_k=5,
             candidate_k=8,
         )
 
-        reranked = rerank_results(
-            query,
-            evidence,
-            top_k=3,
-        )
-
-        return [
+        normalized = [
             {
                 "company_number": company_number,
                 "document_id": item.get("document_id"),
-                "filename": item.get("filename"),
                 "category": item.get("category"),
                 "filing_date": item.get("filing_date"),
                 "page": item.get("page"),
                 "score": item.get("reranker_score"),
-                "evidence": item.get("text", ""),
+                "evidence": item.get("evidence", ""),
             }
-            for item in reranked
+            for item in results
         ]
 
+        # Keep all unique evidence across attempts.
+        existing_keys = {
+            (
+                item.get("document_id"),
+                item.get("page"),
+                item.get("evidence"),
+            )
+            for item in corporate_xray_evidence
+        }
+
+        for item in normalized:
+            key = (
+                item.get("document_id"),
+                item.get("page"),
+                item.get("evidence"),
+            )
+            if key not in existing_keys:
+                corporate_xray_evidence.append(item)
+
+        corporate_xray_state["evidence_sufficient"] = bool(normalized)
+        corporate_xray_state["evidence_completed"] = bool(normalized)
+
+        # The agent may either accept the evidence and finish or
+        # request another search. Hard cap prevents infinite loops.
+        if attempt >= MAX_EVIDENCE_ATTEMPTS:
+            corporate_xray_state["evidence_completed"] = True
+            corporate_xray_state["current_stage"] = "final_answer"
+
+        return normalized
+
     except Exception as exc:
+        if attempt >= MAX_EVIDENCE_ATTEMPTS:
+            corporate_xray_state["evidence_completed"] = True
+            corporate_xray_state["current_stage"] = "final_answer"
+
         return [
             {
                 "status": "error",
+                "company_number": company_number,
+                "attempt": attempt,
                 "message": f"Evidence retrieval failed: {exc}",
             }
         ]
@@ -2242,17 +2303,22 @@ def investigation_complete(final_answer, memory, agent=None):
             "Investigation incomplete. Missing steps: " + ", ".join(missing)
         )
 
+    if not corporate_xray_state.get("selected_company_number"):
+        raise ValueError(
+            "FINAL ANSWER REJECTED: no verified company number is available."
+        )
+
     if not corporate_xray_state.get("evidence_attempts", 0):
         raise ValueError(
             "FINAL ANSWER REJECTED: documentary evidence search has not been attempted."
         )
 
-    if not corporate_xray_state.get("evidence_completed"):
-        # The evidence loop can finish by user/agent decision before the hard cap.
-        # A non-empty evidence search is sufficient to permit synthesis; unsupported
-        # claims are handled by the report-generation prompt and evidence metadata.
-        corporate_xray_state["evidence_completed"] = True
+    if not corporate_xray_evidence and not corporate_xray_state.get("evidence_completed"):
+        raise ValueError(
+            "FINAL ANSWER REJECTED: no documentary evidence was retrieved."
+        )
 
+    corporate_xray_state["evidence_completed"] = True
     return True
 
 
@@ -3145,6 +3211,11 @@ def run_corporate_xray(
 
     reset_corporate_xray_state()
     corporate_xray_state["investigation_question"] = company_name
+    corporate_xray_state["default_evidence_query"] = (
+        f"Recent Companies House documentary evidence for {company_name}: "
+        "director appointments or changes, ownership or PSC changes, "
+        "filing activity, registered charges, and insolvency-related filings."
+    )
     corporate_xray_state["started_at"] = __import__("time").time()
 
     agent = get_corporate_xray_agent()
