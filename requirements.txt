@@ -11,4 +11,5 @@ PyMuPDF
 rank-bm25
 sentence-transformers
 torch
+torchvision
 python-dotenv
