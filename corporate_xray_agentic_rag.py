@@ -7,15 +7,15 @@ from urllib.parse import urlparse
 import numpy as np
 import pymupdf
 import requests
-import torch
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
+from smolagents import (
+    ChatMessage,
+    MessageRole,
+    Model,
+    ToolCallingAgent,
+    InferenceClientModel,
+    tool,
 )
-from smolagents import ChatMessage, MessageRole, Model, ToolCallingAgent, tool
 from smolagents.models import get_tool_json_schema
 
 
@@ -64,8 +64,33 @@ def load_dotenv_file():
 
 load_dotenv_file()
 
-COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip()
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+
+def _get_config_value(name, default=""):
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+
+    try:
+        import streamlit as st
+        value = str(st.secrets.get(name, default)).strip()
+    except Exception:
+        value = str(default).strip()
+
+    return value
+
+
+COMPANIES_HOUSE_API_KEY = _get_config_value("COMPANIES_HOUSE_API_KEY")
+HF_TOKEN = (
+    _get_config_value("HF_TOKEN")
+    or _get_config_value("HUGGINGFACEHUB_API_TOKEN")
+)
+DEPLOYMENT_MODE = _get_config_value(
+    "CORPORATE_XRAY_DEPLOYMENT",
+    "local",
+).lower()
+HF_PROVIDER = _get_config_value(
+    "CORPORATE_XRAY_HF_PROVIDER"
+) or None
 
 
 def require_companies_house_api_key():
@@ -1209,6 +1234,8 @@ def build_company_rag_index(
         is None
     ):
 
+        from sentence_transformers import SentenceTransformer
+
         rag_state[
             "embedding_model"
         ] = SentenceTransformer(
@@ -1243,6 +1270,8 @@ def build_company_rag_index(
         ]
         is None
     ):
+
+        from sentence_transformers import CrossEncoder
 
         rag_state[
             "reranker"
@@ -2619,6 +2648,8 @@ class LocalQwenModel(Model):
             )
         )
 
+        import torch
+
         with torch.inference_mode():
 
             outputs = (
@@ -2693,6 +2724,13 @@ def load_qwen():
     CPU fallback is available for environments without CUDA.
     """
 
+    import torch
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        BitsAndBytesConfig,
+    )
+
     global _qwen_model
     global _qwen_tokenizer
 
@@ -2704,6 +2742,12 @@ def load_qwen():
         return (
             _qwen_model,
             _qwen_tokenizer,
+        )
+
+    if DEPLOYMENT_MODE != "local":
+        raise RuntimeError(
+            "Local Qwen loading is disabled in cloud mode. "
+            "Use InferenceClientModel for deployed inference."
         )
 
     tokenizer = (
@@ -2805,75 +2849,57 @@ def load_qwen():
 # ============================================================
 
 def get_corporate_xray_agent():
-    """
-    Build the single Corporate X-Ray agent.
-    """
-
+    """Build the single Corporate X-Ray agent for local or cloud inference."""
     global _agent
 
     if _agent is not None:
-
         return _agent
 
-    model, tokenizer = (
-        load_qwen()
-    )
+    if DEPLOYMENT_MODE == "cloud":
+        if not HF_TOKEN:
+            raise RuntimeError(
+                "HF_TOKEN is required when CORPORATE_XRAY_DEPLOYMENT=cloud."
+            )
 
-    local_model = (
-        LocalQwenModel(
-
-            model=
-                model,
-
-            tokenizer=
-                tokenizer,
-
-            max_new_tokens=
-                96,
+        model = InferenceClientModel(
+            model_id=MODEL_ID,
+            provider=HF_PROVIDER or "hf-inference",
+            token=HF_TOKEN,
+            max_tokens=256,
+            temperature=0.0,
+            timeout=120,
         )
-    )
+    elif DEPLOYMENT_MODE == "local":
+        model_weights, tokenizer = load_qwen()
+        model = LocalQwenModel(
+            model=model_weights,
+            tokenizer=tokenizer,
+            max_new_tokens=96,
+        )
+    else:
+        raise RuntimeError(
+            "CORPORATE_XRAY_DEPLOYMENT must be 'local' or 'cloud'."
+        )
 
     xray_tools = [
-
         company_search,
-
         company_profile,
-
         company_officers,
-
         company_pscs,
-
         company_filings,
-
         company_charges,
-
         company_insolvency,
-
         search_company_evidence,
     ]
 
-    # Hard guarantee: exactly 8 tools.
-    assert len(
-        xray_tools
-    ) == 8
+    assert len(xray_tools) == 8
 
     _agent = ToolCallingAgent(
-
-        tools=
-            xray_tools,
-
-        model=
-            local_model,
-
-        max_steps=
-            12,
-
-        verbosity_level=
-            1,
-
-        final_answer_checks=[
-            investigation_complete
-        ],
+        tools=xray_tools,
+        model=model,
+        max_steps=12,
+        verbosity_level=1,
+        final_answer_checks=[investigation_complete],
     )
 
     return _agent
@@ -3308,15 +3334,24 @@ def system_health_check():
         "reranker":
             RERANKER_MODEL_ID,
 
+        "deployment_mode":
+            DEPLOYMENT_MODE,
+
+        "hf_provider":
+            HF_PROVIDER or "hf-inference",
+
         "cuda_available":
-            torch.cuda.is_available(),
+            (
+                __import__("torch").cuda.is_available()
+                if DEPLOYMENT_MODE == "local"
+                else False
+            ),
 
         "gpu":
             (
-                torch.cuda.get_device_name(
-                    0
-                )
-                if torch.cuda.is_available()
+                __import__("torch").cuda.get_device_name(0)
+                if DEPLOYMENT_MODE == "local"
+                and __import__("torch").cuda.is_available()
                 else "CPU"
             ),
     }
