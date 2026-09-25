@@ -29,13 +29,11 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CH_API_URL = "https://api.company-information.service.gov.uk"
 DOC_API_URL = "https://document-api.company-information.service.gov.uk"
 
-LOCAL_MODEL_ID = os.getenv("CORPORATE_XRAY_LOCAL_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
+MODEL_ID = os.getenv("CORPORATE_XRAY_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 CLOUD_PRIMARY_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
 CLOUD_PRIMARY_PROVIDER = "nscale"
 CLOUD_FALLBACK_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 CLOUD_FALLBACK_PROVIDER = "together"
-CLOUD_RETRY_ATTEMPTS = 2
-CLOUD_RETRY_BACKOFF = 2.0
 EMBEDDING_MODEL_ID = os.getenv(
     "CORPORATE_XRAY_EMBEDDING_MODEL_ID",
     "BAAI/bge-small-en-v1.5",
@@ -95,7 +93,16 @@ DEPLOYMENT_MODE = _get_config_value(
     "CORPORATE_XRAY_DEPLOYMENT",
     "local",
 ).lower()
-HF_PROVIDER = _get_config_value("CORPORATE_XRAY_HF_PROVIDER") or "auto"
+HF_PROVIDER = _get_config_value(
+    "CORPORATE_XRAY_HF_PROVIDER"
+).lower() or CLOUD_PRIMARY_PROVIDER
+
+if DEPLOYMENT_MODE == "cloud" and HF_PROVIDER in {
+    "hf-inference",
+    "featherless-ai",
+    "auto",
+}:
+    HF_PROVIDER = CLOUD_PRIMARY_PROVIDER
 
 
 def require_companies_house_api_key():
@@ -2382,7 +2389,7 @@ class LocalQwenModel(Model):
         super().__init__(
 
             model_id=
-                LOCAL_MODEL_ID,
+                MODEL_ID,
 
             max_new_tokens=
                 max_new_tokens,
@@ -2758,7 +2765,7 @@ def load_qwen():
     tokenizer = (
         AutoTokenizer.from_pretrained(
 
-            LOCAL_MODEL_ID,
+            MODEL_ID,
 
             token=(
                 HF_TOKEN
@@ -2794,7 +2801,7 @@ def load_qwen():
             AutoModelForCausalLM
             .from_pretrained(
 
-                LOCAL_MODEL_ID,
+                MODEL_ID,
 
                 token=(
                     HF_TOKEN
@@ -2825,7 +2832,7 @@ def load_qwen():
             AutoModelForCausalLM
             .from_pretrained(
 
-                LOCAL_MODEL_ID,
+                MODEL_ID,
 
                 token=(
                     HF_TOKEN
@@ -2849,51 +2856,19 @@ def load_qwen():
     )
 
 
+# ============================================================
+# 34. RESILIENT CLOUD MODEL
+# ============================================================
+
 class ResilientHFModel(Model):
-    """HF inference model with bounded retry and provider failover."""
+    """Use a primary HF provider with bounded retry and fallback."""
 
-    def __init__(self, candidates, max_tokens=256, temperature=0.0, timeout=120):
-        super().__init__(model_id=candidates[0][0])
-        self.candidates = candidates
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.timeout = timeout
-        self._models = {}
-
-    def _get_model(self, model_id, provider):
-        key = (model_id, provider)
-        if key not in self._models:
-            self._models[key] = InferenceClientModel(
-                model_id=model_id,
-                provider=provider,
-                token=HF_TOKEN,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                timeout=self.timeout,
-            )
-        return self._models[key]
-
-    @staticmethod
-    def _is_transient_error(exc):
-        text = str(exc).lower()
-        return any(
-            marker in text
-            for marker in (
-                "500",
-                "502",
-                "503",
-                "504",
-                "429",
-                "timeout",
-                "timed out",
-                "temporarily unavailable",
-                "service unavailable",
-                "server error",
-                "overloaded",
-                "busy",
-                "rate limit",
-            )
+    def __init__(self, primary, fallback):
+        super().__init__(
+            model_id=f"{CLOUD_PRIMARY_MODEL_ID} via {CLOUD_PRIMARY_PROVIDER}"
         )
+        self.primary = primary
+        self.fallback = fallback
 
     def generate(
         self,
@@ -2903,34 +2878,27 @@ class ResilientHFModel(Model):
         tools_to_call_from=None,
         **kwargs,
     ):
-        failures = []
+        last_error = None
 
-        for model_id, provider in self.candidates:
-            model = self._get_model(model_id, provider)
-
-            for attempt in range(CLOUD_RETRY_ATTEMPTS):
+        for model in (self.primary, self.fallback):
+            for attempt in range(2):
                 try:
                     return model.generate(
-                        messages,
+                        messages=messages,
                         stop_sequences=stop_sequences,
                         response_format=response_format,
                         tools_to_call_from=tools_to_call_from,
                         **kwargs,
                     )
                 except Exception as exc:
-                    failures.append(f"{provider}: {exc}")
-
-                    if not self._is_transient_error(exc):
-                        raise
-
-                    if attempt < CLOUD_RETRY_ATTEMPTS - 1:
-                        time.sleep(CLOUD_RETRY_BACKOFF * (2 ** attempt))
+                    last_error = exc
+                    if attempt == 0:
+                        time.sleep(2)
 
         raise RuntimeError(
-            "Hugging Face inference providers are temporarily unavailable. "
-            "Automatic retry and failover were exhausted. "
-            "Details: " + " | ".join(failures[-4:])
-        )
+            "Cloud inference failed after retrying both configured providers. "
+            f"Last error: {last_error}"
+        ) from last_error
 
 
 # ============================================================
@@ -2950,15 +2918,25 @@ def get_corporate_xray_agent():
                 "HF_TOKEN is required when CORPORATE_XRAY_DEPLOYMENT=cloud."
             )
 
-        model = ResilientHFModel(
-            candidates=[
-                (CLOUD_PRIMARY_MODEL_ID, CLOUD_PRIMARY_PROVIDER),
-                (CLOUD_FALLBACK_MODEL_ID, CLOUD_FALLBACK_PROVIDER),
-            ],
+        primary = InferenceClientModel(
+            model_id=CLOUD_PRIMARY_MODEL_ID,
+            provider=CLOUD_PRIMARY_PROVIDER,
+            token=HF_TOKEN,
             max_tokens=256,
             temperature=0.0,
             timeout=120,
         )
+
+        fallback = InferenceClientModel(
+            model_id=CLOUD_FALLBACK_MODEL_ID,
+            provider=CLOUD_FALLBACK_PROVIDER,
+            token=HF_TOKEN,
+            max_tokens=256,
+            temperature=0.0,
+            timeout=120,
+        )
+
+        model = ResilientHFModel(primary, fallback)
     elif DEPLOYMENT_MODE == "local":
         model_weights, tokenizer = load_qwen()
         model = LocalQwenModel(
@@ -3416,11 +3394,14 @@ def system_health_check():
             ),
 
         "model":
-            (
-                CLOUD_PRIMARY_MODEL_ID
-                if DEPLOYMENT_MODE == "cloud"
-                else LOCAL_MODEL_ID
-            ),
+            CLOUD_PRIMARY_MODEL_ID
+            if DEPLOYMENT_MODE == "cloud"
+            else MODEL_ID,
+
+        "fallback_model":
+            CLOUD_FALLBACK_MODEL_ID
+            if DEPLOYMENT_MODE == "cloud"
+            else None,
 
         "embedding_model":
             EMBEDDING_MODEL_ID,
@@ -3432,11 +3413,9 @@ def system_health_check():
             DEPLOYMENT_MODE,
 
         "hf_provider":
-            (
-                f"{CLOUD_PRIMARY_PROVIDER} -> {CLOUD_FALLBACK_PROVIDER}"
-                if DEPLOYMENT_MODE == "cloud"
-                else "local"
-            ),
+            f"{CLOUD_PRIMARY_PROVIDER} -> {CLOUD_FALLBACK_PROVIDER}"
+            if DEPLOYMENT_MODE == "cloud"
+            else HF_PROVIDER,
 
         "cuda_available":
             (
