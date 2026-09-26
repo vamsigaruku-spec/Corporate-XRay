@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -28,7 +29,16 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CH_API_URL = "https://api.company-information.service.gov.uk"
 DOC_API_URL = "https://document-api.company-information.service.gov.uk"
 
+# Local model. Cloud mode uses the pinned Hugging Face router models below.
 MODEL_ID = os.getenv("CORPORATE_XRAY_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
+
+# Cloud inference is pinned to the Hugging Face OpenAI-compatible router.
+# Provider selection is encoded in the model ID, so the legacy
+# CORPORATE_XRAY_HF_PROVIDER setting cannot redirect cloud requests.
+HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
+CLOUD_PRIMARY_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507:nscale"
+CLOUD_FALLBACK_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct:together"
+
 EMBEDDING_MODEL_ID = os.getenv(
     "CORPORATE_XRAY_EMBEDDING_MODEL_ID",
     "BAAI/bge-small-en-v1.5",
@@ -88,9 +98,9 @@ DEPLOYMENT_MODE = _get_config_value(
     "CORPORATE_XRAY_DEPLOYMENT",
     "local",
 ).lower()
-HF_PROVIDER = _get_config_value(
-    "CORPORATE_XRAY_HF_PROVIDER"
-) or None
+# Legacy compatibility note:
+# CORPORATE_XRAY_HF_PROVIDER is intentionally ignored.
+# Cloud provider selection is hard-pinned by the model IDs above.
 
 
 def require_companies_house_api_key():
@@ -2747,7 +2757,7 @@ def load_qwen():
     if DEPLOYMENT_MODE != "local":
         raise RuntimeError(
             "Local Qwen loading is disabled in cloud mode. "
-            "Use InferenceClientModel for deployed inference."
+            "Use the pinned Hugging Face router configuration for deployed inference."
         )
 
     tokenizer = (
@@ -2845,8 +2855,176 @@ def load_qwen():
 
 
 # ============================================================
-# 34. CREATE THE ONE AGENT
+# 34. RESILIENT CLOUD MODEL + CREATE THE ONE AGENT
 # ============================================================
+
+def _is_transient_cloud_error(exc):
+    """
+    Return True for failures that are reasonable to retry.
+
+    Provider-side 429/5xx responses, timeouts, and connection failures
+    are treated as transient. Authentication, invalid-model, and other
+    configuration errors are not repeatedly retried.
+    """
+    status_code = getattr(exc, "status_code", None)
+
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+
+    if status_code is not None:
+        try:
+            return int(status_code) in {
+                408, 409, 425, 429, 500, 502, 503, 504
+            }
+        except (TypeError, ValueError):
+            pass
+
+    message = str(exc).lower()
+
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "service unavailable",
+        "server error",
+        "connection error",
+        "connection reset",
+        "connection aborted",
+        "connecterror",
+        "readerror",
+        "503",
+        "502",
+        "504",
+        "429",
+        "rate limit",
+        "too many requests",
+    )
+
+    return any(marker in message for marker in transient_markers)
+
+
+class ResilientHFModel(Model):
+    """
+    Deterministic cloud model wrapper.
+
+    Primary:
+        Qwen/Qwen3-4B-Instruct-2507:nscale
+
+    Fallback:
+        Qwen/Qwen2.5-7B-Instruct:together
+
+    Both requests use:
+        https://router.huggingface.co/v1
+
+    The provider is encoded in each model ID. The legacy
+    CORPORATE_XRAY_HF_PROVIDER secret is never consulted.
+    """
+
+    def __init__(self, primary, fallback):
+        super().__init__(
+            model_id=(
+                f"{CLOUD_PRIMARY_MODEL_ID} -> "
+                f"{CLOUD_FALLBACK_MODEL_ID}"
+            )
+        )
+        self.primary = primary
+        self.fallback = fallback
+
+    @staticmethod
+    def _call_model(
+        model,
+        messages,
+        stop_sequences,
+        response_format,
+        tools_to_call_from,
+        kwargs,
+    ):
+        return model.generate(
+            messages=messages,
+            stop_sequences=stop_sequences,
+            response_format=response_format,
+            tools_to_call_from=tools_to_call_from,
+            **kwargs,
+        )
+
+    def _try_with_retry(
+        self,
+        model,
+        messages,
+        stop_sequences,
+        response_format,
+        tools_to_call_from,
+        kwargs,
+        label,
+    ):
+        last_error = None
+
+        # First attempt is immediate. Only a transient failure receives
+        # one short retry. Any other error moves directly to fallback.
+        for attempt in range(2):
+            try:
+                return self._call_model(
+                    model=model,
+                    messages=messages,
+                    stop_sequences=stop_sequences,
+                    response_format=response_format,
+                    tools_to_call_from=tools_to_call_from,
+                    kwargs=kwargs,
+                )
+            except Exception as exc:
+                last_error = exc
+
+                if attempt == 0 and _is_transient_cloud_error(exc):
+                    time.sleep(2)
+                    continue
+
+                break
+
+        raise RuntimeError(
+            f"{label} cloud inference failed: {last_error}"
+        ) from last_error
+
+    def generate(
+        self,
+        messages,
+        stop_sequences=None,
+        response_format=None,
+        tools_to_call_from=None,
+        **kwargs,
+    ):
+        primary_error = None
+
+        try:
+            return self._try_with_retry(
+                model=self.primary,
+                messages=messages,
+                stop_sequences=stop_sequences,
+                response_format=response_format,
+                tools_to_call_from=tools_to_call_from,
+                kwargs=kwargs,
+                label="Primary (Nscale)",
+            )
+        except Exception as exc:
+            primary_error = exc
+
+        try:
+            return self._try_with_retry(
+                model=self.fallback,
+                messages=messages,
+                stop_sequences=stop_sequences,
+                response_format=response_format,
+                tools_to_call_from=tools_to_call_from,
+                kwargs=kwargs,
+                label="Fallback (Together)",
+            )
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Cloud inference failed on both pinned providers. "
+                f"Primary error: {primary_error}. "
+                f"Fallback error: {fallback_error}"
+            ) from fallback_error
+
 
 def get_corporate_xray_agent():
     """Build the single Corporate X-Ray agent for local or cloud inference."""
@@ -2858,17 +3036,36 @@ def get_corporate_xray_agent():
     if DEPLOYMENT_MODE == "cloud":
         if not HF_TOKEN:
             raise RuntimeError(
-                "HF_TOKEN is required when CORPORATE_XRAY_DEPLOYMENT=cloud."
+                "HF_TOKEN is required when "
+                "CORPORATE_XRAY_DEPLOYMENT=cloud."
             )
 
-        model = InferenceClientModel(
-            model_id=MODEL_ID,
-            provider=HF_PROVIDER or "hf-inference",
+        # No provider= argument is used.
+        # base_url points to the common HF OpenAI-compatible router and
+        # the :nscale / :together suffix pins the provider explicitly.
+        primary = InferenceClientModel(
+            model_id=CLOUD_PRIMARY_MODEL_ID,
+            base_url=HF_ROUTER_BASE_URL,
             token=HF_TOKEN,
             max_tokens=256,
             temperature=0.0,
             timeout=120,
         )
+
+        fallback = InferenceClientModel(
+            model_id=CLOUD_FALLBACK_MODEL_ID,
+            base_url=HF_ROUTER_BASE_URL,
+            token=HF_TOKEN,
+            max_tokens=256,
+            temperature=0.0,
+            timeout=120,
+        )
+
+        model = ResilientHFModel(
+            primary=primary,
+            fallback=fallback,
+        )
+
     elif DEPLOYMENT_MODE == "local":
         model_weights, tokenizer = load_qwen()
         model = LocalQwenModel(
@@ -2876,6 +3073,7 @@ def get_corporate_xray_agent():
             tokenizer=tokenizer,
             max_new_tokens=96,
         )
+
     else:
         raise RuntimeError(
             "CORPORATE_XRAY_DEPLOYMENT must be 'local' or 'cloud'."
@@ -3326,7 +3524,18 @@ def system_health_check():
             ),
 
         "model":
-            MODEL_ID,
+            (
+                CLOUD_PRIMARY_MODEL_ID
+                if DEPLOYMENT_MODE == "cloud"
+                else MODEL_ID
+            ),
+
+        "fallback_model":
+            (
+                CLOUD_FALLBACK_MODEL_ID
+                if DEPLOYMENT_MODE == "cloud"
+                else None
+            ),
 
         "embedding_model":
             EMBEDDING_MODEL_ID,
@@ -3337,8 +3546,19 @@ def system_health_check():
         "deployment_mode":
             DEPLOYMENT_MODE,
 
+        "hf_router":
+            (
+                HF_ROUTER_BASE_URL
+                if DEPLOYMENT_MODE == "cloud"
+                else None
+            ),
+
         "hf_provider":
-            HF_PROVIDER or "hf-inference",
+            (
+                "nscale -> together"
+                if DEPLOYMENT_MODE == "cloud"
+                else "local"
+            ),
 
         "cuda_available":
             (
