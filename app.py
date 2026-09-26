@@ -1,3519 +1,1520 @@
-import json
-import os
-import re
-import time
-from pathlib import Path
-from urllib.parse import urlparse
+import html
 
-import numpy as np
-import pymupdf
-import requests
-from rank_bm25 import BM25Okapi
-from smolagents import (
-    ChatMessage,
-    MessageRole,
-    Model,
-    ToolCallingAgent,
-    OpenAIModel,
-    tool,
-)
-from smolagents.models import get_tool_json_schema
+import streamlit as st
+
+import corporate_xray_agentic_rag as backend
 
 
 # ============================================================
-# 1. CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
-PROJECT_DIR = Path(__file__).resolve().parent
-
-CH_API_URL = "https://api.company-information.service.gov.uk"
-DOC_API_URL = "https://document-api.company-information.service.gov.uk"
-
-MODEL_ID = os.getenv("CORPORATE_XRAY_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
-
-# Cloud inference uses two current Hugging Face providers for the same
-# Qwen model. Provider is pinned by the :provider suffix.
-# Both routes support tool calling.
-CLOUD_PRIMARY_MODEL_ID = "Qwen/Qwen3-14B:nscale"
-CLOUD_FALLBACK_MODEL_ID = "Qwen/Qwen3-14B:deepinfra"
-HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
-EMBEDDING_MODEL_ID = os.getenv(
-    "CORPORATE_XRAY_EMBEDDING_MODEL_ID",
-    "BAAI/bge-small-en-v1.5",
+st.set_page_config(
+    page_title="Corporate X-Ray",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-RERANKER_MODEL_ID = os.getenv(
-    "CORPORATE_XRAY_RERANKER_MODEL_ID",
-    "BAAI/bge-reranker-base",
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "investigation_result" not in st.session_state:
+    st.session_state.investigation_result = None
+
+if "investigation_error" not in st.session_state:
+    st.session_state.investigation_error = None
+
+if "company_name" not in st.session_state:
+    st.session_state.company_name = "REVOLUT LTD"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def esc(value):
+    return html.escape(str(value)) if value is not None else ""
+
+
+def safe_list(value):
+    return value if isinstance(value, list) else []
+
+
+# ============================================================
+# GLOBAL CSS
+# ============================================================
+
+st.html(
+    """
+    <style>
+
+    /* ================================
+       APP
+       ================================ */
+
+    .stApp {
+        background:
+            radial-gradient(
+                circle at 88% 0%,
+                rgba(79,70,229,0.08),
+                transparent 30%
+            ),
+            linear-gradient(
+                180deg,
+                #f8fafc 0%,
+                #f1f5f9 100%
+            );
+    }
+
+    .main .block-container {
+        max-width: 1450px !important;
+        padding-top: 2rem !important;
+        padding-bottom: 3rem !important;
+        padding-left: 2.5rem !important;
+        padding-right: 2.5rem !important;
+    }
+
+    #MainMenu,
+    footer {
+        visibility: hidden;
+    }
+
+    header[data-testid="stHeader"] {
+        background: rgba(248,250,252,0.96) !important;
+        border-bottom: 1px solid #e2e8f0 !important;
+    }
+
+
+    /* ================================
+       SIDEBAR
+       ================================ */
+
+    section[data-testid="stSidebar"] {
+        background: #111827 !important;
+        border-right: 1px solid #1f2937 !important;
+    }
+
+    section[data-testid="stSidebar"] div[data-testid="stMarkdownContainer"] p,
+    section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] p {
+        color: #cbd5e1 !important;
+    }
+
+
+    /* ================================
+       NATIVE INPUTS
+       ================================ */
+
+    div[data-testid="stTextInput"] label {
+        color: #334155 !important;
+        font-size: 0.76rem !important;
+        font-weight: 800 !important;
+    }
+
+    div[data-testid="stTextInput"] input {
+        min-height: 50px !important;
+        background: #ffffff !important;
+        color: #0f172a !important;
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 12px !important;
+        font-size: 0.84rem !important;
+    }
+
+    div[data-testid="stTextInput"] input:focus {
+        border-color: #6366f1 !important;
+        box-shadow: 0 0 0 3px rgba(99,102,241,0.10) !important;
+    }
+
+    div.stButton > button {
+        min-height: 50px !important;
+        width: 100% !important;
+        border: none !important;
+        border-radius: 12px !important;
+        background: linear-gradient(
+            135deg,
+            #4f46e5,
+            #6366f1
+        ) !important;
+        color: #ffffff !important;
+        font-weight: 900 !important;
+        box-shadow: 0 8px 18px rgba(79,70,229,0.22) !important;
+    }
+
+    div.stButton > button:hover {
+        background: linear-gradient(
+            135deg,
+            #4338ca,
+            #4f46e5
+        ) !important;
+    }
+
+
+    /* ================================
+       TABS
+       ================================ */
+
+    button[data-baseweb="tab"] {
+        color: #64748b !important;
+        font-weight: 800 !important;
+    }
+
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: #4f46e5 !important;
+    }
+
+
+    /* ================================
+       STATUS
+       ================================ */
+
+    div[data-testid="stStatusWidget"] {
+        border-radius: 14px !important;
+    }
+
+
+    /* ================================
+       MOBILE
+       ================================ */
+
+    @media (max-width: 900px) {
+        .main .block-container {
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+        }
+    }
+
+    </style>
+    """
 )
-MAX_EVIDENCE_ATTEMPTS = 3
 
 
-def load_dotenv_file():
-    """Load simple KEY=VALUE pairs from the local .env file."""
-    env_path = PROJECT_DIR / ".env"
-    if not env_path.exists():
-        return
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
+with st.sidebar:
 
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
+    st.markdown("### Corporate X-Ray")
+    st.caption("Autonomous UK company intelligence")
 
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
+    st.divider()
 
-        if key and value and key not in os.environ:
-            os.environ[key] = value
+    st.markdown("**INVESTIGATION PIPELINE**")
 
+    for item in [
+        "○ Company identity",
+        "○ Company profile",
+        "○ Officers",
+        "○ PSC / ownership",
+        "○ Filing history",
+        "○ Charges",
+        "○ Insolvency",
+        "○ Documentary evidence",
+    ]:
+        st.markdown(item)
 
-load_dotenv_file()
+    st.divider()
 
-
-def _get_config_value(name, default=""):
-    value = os.getenv(name, "").strip()
-    if value:
-        return value
+    st.markdown("**SYSTEM**")
 
     try:
-        import streamlit as st
-        value = str(st.secrets.get(name, default)).strip()
+        health = backend.system_health_check()
+
+        st.markdown("✓ 1 AI agent")
+        st.markdown("✓ 8 investigation tools")
+
+        if health.get("cuda_available"):
+            st.markdown("✓ CUDA enabled")
+        else:
+            st.markdown("○ CPU mode")
+
     except Exception:
-        value = str(default).strip()
+        st.markdown("○ Backend status unavailable")
 
-    return value
+    st.divider()
+
+    st.caption(
+        "Source: Companies House public data."
+    )
+
+    st.caption(
+        "Corporate X-Ray is an intelligence-support "
+        "system for company research and evidence "
+        "discovery. It is not legal or accounting advice."
+    )
 
 
-COMPANIES_HOUSE_API_KEY = _get_config_value("COMPANIES_HOUSE_API_KEY")
-HF_TOKEN = (
-    _get_config_value("HF_TOKEN")
-    or _get_config_value("HUGGINGFACEHUB_API_TOKEN")
+# ============================================================
+# TOP NAV
+# ============================================================
+
+st.html(
+    """
+    <div style="
+        width:100%;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:20px;
+        padding:14px 18px;
+        margin-bottom:30px;
+        border:1px solid #e2e8f0;
+        border-radius:18px;
+        background:#ffffff;
+        box-shadow:0 8px 26px rgba(15,23,42,0.05);
+    ">
+
+        <div style="
+            display:flex;
+            align-items:center;
+            gap:12px;
+        ">
+
+            <div style="
+                width:40px;
+                height:40px;
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                border-radius:12px;
+                background:linear-gradient(
+                    135deg,
+                    #4338ca,
+                    #6366f1
+                );
+                color:white;
+                font-weight:900;
+                font-size:16px;
+            ">
+                ◈
+            </div>
+
+            <div>
+
+                <div style="
+                    color:#0f172a;
+                    font-weight:900;
+                    font-size:16px;
+                ">
+                    Corporate X-Ray
+                </div>
+
+                <div style="
+                    color:#64748b;
+                    font-size:11px;
+                    margin-top:2px;
+                ">
+                    UK corporate intelligence
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div style="
+            display:flex;
+            gap:8px;
+            flex-wrap:wrap;
+            justify-content:flex-end;
+        ">
+
+            <div style="
+                padding:7px 12px;
+                border-radius:999px;
+                background:#eef2ff;
+                border:1px solid #c7d2fe;
+                color:#4338ca;
+                font-size:10px;
+                font-weight:900;
+            ">
+                1 AI AGENT
+            </div>
+
+            <div style="
+                padding:7px 12px;
+                border-radius:999px;
+                background:#ffffff;
+                border:1px solid #e2e8f0;
+                color:#475569;
+                font-size:10px;
+                font-weight:900;
+            ">
+                8 TOOLS
+            </div>
+
+            <div style="
+                padding:7px 12px;
+                border-radius:999px;
+                background:#ffffff;
+                border:1px solid #e2e8f0;
+                color:#475569;
+                font-size:10px;
+                font-weight:900;
+            ">
+                COMPANIES HOUSE
+            </div>
+
+        </div>
+
+    </div>
+    """
 )
-DEPLOYMENT_MODE = _get_config_value(
-    "CORPORATE_XRAY_DEPLOYMENT",
-    "local",
-).lower()
-# Kept only for backwards-compatible health reporting. It is NOT used for
-# cloud model routing, so an old Streamlit secret cannot redirect requests.
-HF_PROVIDER = "pinned"
-
-
-def require_companies_house_api_key():
-    """Return the configured Companies House API key or fail clearly."""
-    key = os.getenv("COMPANIES_HOUSE_API_KEY", "").strip() or COMPANIES_HOUSE_API_KEY
-    if not key:
-        raise RuntimeError(
-            "COMPANIES_HOUSE_API_KEY is missing. "
-            "Create a local .env file or configure the environment variable "
-            "before running Corporate X-Ray."
-        )
-    return key
 
 
 # ============================================================
-# 3. CORPORATE X-RAY WORKFLOW
+# HERO
 # ============================================================
 
-WORKFLOW = [
-    "company_search",
-    "company_profile",
-    "company_officers",
-    "company_pscs",
-    "company_filings",
-    "company_charges",
-    "company_insolvency",
-    "search_company_evidence",
-    "final_answer",
-]
-
-
-TOOL_NAMES = WORKFLOW[:-1]
-
-
-# ============================================================
-# 4. INVESTIGATION STATE
-# ============================================================
-
-corporate_xray_state = {
-    "current_stage": "company_search",
-    "company_search_completed": False,
-    "company_profile_completed": False,
-    "officers_completed": False,
-    "pscs_completed": False,
-    "filings_completed": False,
-    "charges_completed": False,
-    "insolvency_completed": False,
-    "evidence_completed": False,
-    "selected_company_name": None,
-    "selected_company_number": None,
-    "investigation_question": "",
-    "default_evidence_query": "",
-    "evidence_attempts": 0,
-    "evidence_queries": [],
-    "evidence_sufficient": False,
-    "started_at": None,
-}
-
-
-corporate_xray_data = {
-
-    "company_search":
-        None,
-
-    "company_profile":
-        None,
-
-    "officers":
-        None,
-
-    "pscs":
-        None,
-
-    "filings":
-        None,
-
-    "charges":
-        None,
-
-    "insolvency":
-        None,
-}
-
-
-corporate_xray_evidence = []
-
-
-# ============================================================
-# 5. RAG STATE
-# ============================================================
-
-rag_state = {
-
-    "company_number":
-        None,
-
-    "chunks":
-        [],
-
-    "bm25":
-        None,
-
-    "embedding_model":
-        None,
-
-    "document_embeddings":
-        None,
-
-    "reranker":
-        None,
-}
-
-
-# ============================================================
-# 6. MODEL CACHE
-# ============================================================
-
-_qwen_model = None
-_qwen_tokenizer = None
-_agent = None
-
-
-# ============================================================
-# 7. RESET STATE
-# ============================================================
-
-def reset_corporate_xray_state():
-    """Reset investigation, evidence and telemetry state for a new run."""
-    corporate_xray_state.update({
-        "current_stage": "company_search",
-        "company_search_completed": False,
-        "company_profile_completed": False,
-        "officers_completed": False,
-        "pscs_completed": False,
-        "filings_completed": False,
-        "charges_completed": False,
-        "insolvency_completed": False,
-        "evidence_completed": False,
-        "selected_company_name": None,
-        "selected_company_number": None,
-        "investigation_question": "",
-        "default_evidence_query": "",
-        "evidence_attempts": 0,
-        "evidence_queries": [],
-        "started_at": None,
-    })
-
-    for key in corporate_xray_data:
-        corporate_xray_data[key] = None
-
-    corporate_xray_evidence.clear()
-
-    rag_state["company_number"] = None
-    rag_state["chunks"] = []
-    rag_state["bm25"] = None
-    rag_state["document_embeddings"] = None
-
-
-# ============================================================
-# 8. WORKFLOW HELPERS
-# ============================================================
-
-def advance_stage(completed_stage):
-    """Advance the guarded structured workflow. Evidence remains agent-controlled."""
-    if completed_stage == "search_company_evidence":
-        if corporate_xray_state["evidence_attempts"] >= MAX_EVIDENCE_ATTEMPTS:
-            corporate_xray_state["evidence_completed"] = True
-            corporate_xray_state["current_stage"] = "final_answer"
-        else:
-            corporate_xray_state["current_stage"] = "search_company_evidence"
-        return
-
-    index = WORKFLOW.index(completed_stage)
-    if index + 1 < len(WORKFLOW):
-        corporate_xray_state["current_stage"] = WORKFLOW[index + 1]
-    else:
-        corporate_xray_state["current_stage"] = "final_answer"
-
-
-def current_company_number():
+st.html(
     """
-    Return the selected company number.
+    <div style="
+        padding:0 0 6px 0;
+    ">
+
+        <div style="
+            color:#4f46e5;
+            font-size:11px;
+            font-weight:900;
+            letter-spacing:2.5px;
+            text-transform:uppercase;
+            margin-bottom:10px;
+        ">
+            CORPORATE X-RAY
+        </div>
+
+        <div style="
+            color:#0b1220;
+            font-size:clamp(40px,5vw,68px);
+            line-height:0.98;
+            letter-spacing:-3px;
+            font-weight:950;
+            margin:0;
+        ">
+            UK Company
+            <span style="color:#4f46e5;">
+                Due-Diligence
+            </span>
+            Engine
+        </div>
+
+        <div style="
+            max-width:980px;
+            margin-top:18px;
+            color:#475569;
+            font-size:15px;
+            line-height:1.75;
+        ">
+            Investigate UK companies using official Companies House
+            records, documentary evidence retrieval, hybrid RAG,
+            reranking and one autonomous AI agent.
+        </div>
+
+    </div>
     """
-
-    number = (
-        corporate_xray_state.get(
-            "selected_company_number"
-        )
-    )
-
-    if not number:
-
-        raise RuntimeError(
-            "No company has been selected."
-        )
-
-    return number
+)
 
 
 # ============================================================
-# 9. COMPANIES HOUSE API
+# INVESTIGATION CARD
 # ============================================================
 
-def companies_house_get(
-    endpoint,
-    params=None,
-    document_api=False,
-):
+st.html(
     """
-    Perform authenticated GET request.
+    <div style="
+        margin-top:26px;
+        padding:22px;
+        border:1px solid #dfe6ef;
+        border-radius:18px;
+        background:#ffffff;
+        box-shadow:0 12px 32px rgba(15,23,42,0.05);
+    ">
+
+        <div style="
+            color:#0f172a;
+            font-size:17px;
+            font-weight:900;
+        ">
+            Start an investigation
+        </div>
+
+        <div style="
+            margin-top:5px;
+            color:#64748b;
+            font-size:12px;
+            line-height:1.6;
+        ">
+            Enter the exact UK legal company name.
+            Corporate X-Ray identifies the company and
+            executes the investigation pipeline automatically.
+        </div>
+
+    </div>
     """
-
-    base_url = (
-        DOC_API_URL
-        if document_api
-        else CH_API_URL
-    )
-
-    response = requests.get(
-        f"{base_url}{endpoint}",
-
-        auth=(
-            require_companies_house_api_key(),
-            "",
-        ),
-
-        params=params,
-
-        timeout=60,
-    )
-
-    if response.status_code == 404:
-
-        return None
-
-    if not response.ok:
-
-        raise RuntimeError(
-            "Companies House request failed "
-            f"({response.status_code}): "
-            f"{response.text[:500]}"
-        )
-
-    return response.json()
+)
 
 
 # ============================================================
-# 10. SEARCH COMPANY
+# INPUT
 # ============================================================
 
-def search_company_api(
-    query,
-    limit=10,
-):
-    """
-    Search Companies House.
-    """
-
-    data = companies_house_get(
-        "/search/companies",
-
-        params={
-            "q":
-                query,
-
-            "items_per_page":
-                limit,
-        },
-    )
-
-    if not data:
-        return []
-
-    results = []
-
-    for item in data.get(
-        "items",
-        [],
-    ):
-
-        address = (
-            item.get(
-                "address"
-            )
-            or {}
-        )
-
-        results.append({
-
-            "company_name":
-                item.get(
-                    "title"
-                ),
-
-            "company_number":
-                item.get(
-                    "company_number"
-                ),
-
-            "company_status":
-                item.get(
-                    "company_status"
-                ),
-
-            "company_type":
-                item.get(
-                    "company_type"
-                ),
-
-            "date_of_creation":
-                item.get(
-                    "date_of_creation"
-                ),
-
-            "address_snippet":
-                address.get(
-                    "address_line_1"
-                ),
-        })
-
-    return results
-
-
-# ============================================================
-# 11. COMPANY PROFILE
-# ============================================================
-
-def get_company_profile(
-    company_number,
-):
-    """
-    Retrieve official company profile.
-    """
-
-    data = companies_house_get(
-        f"/company/{company_number}"
-    )
-
-    if data is None:
-
-        return {
-            "error":
-                (
-                    f"Company "
-                    f"{company_number} "
-                    "was not found."
-                )
-        }
-
-    accounts = (
-        data.get(
-            "accounts"
-        )
-        or {}
-    )
-
-    last_accounts = (
-        accounts.get(
-            "last_accounts"
-        )
-        or {}
-    )
-
-    next_accounts = (
-        accounts.get(
-            "next_accounts"
-        )
-        or {}
-    )
-
-    confirmation = (
-        data.get(
-            "confirmation_statement"
-        )
-        or {}
-    )
-
-    address = (
-        data.get(
-            "registered_office_address"
-        )
-        or {}
-    )
-
-    return {
-
-        "company_name":
-            data.get(
-                "company_name"
-            ),
-
-        "company_number":
-            data.get(
-                "company_number"
-            ),
-
-        "company_status":
-            data.get(
-                "company_status"
-            ),
-
-        "company_type":
-            data.get(
-                "type"
-            ),
-
-        "date_of_creation":
-            data.get(
-                "date_of_creation"
-            ),
-
-        "date_of_cessation":
-            data.get(
-                "date_of_cessation"
-            ),
-
-        "jurisdiction":
-            data.get(
-                "jurisdiction"
-            ),
-
-        "sic_codes":
-            data.get(
-                "sic_codes",
-                [],
-            ),
-
-        "registered_office": {
-
-            "address_line_1":
-                address.get(
-                    "address_line_1"
-                ),
-
-            "locality":
-                address.get(
-                    "locality"
-                ),
-
-            "postal_code":
-                address.get(
-                    "postal_code"
-                ),
-
-            "country":
-                address.get(
-                    "country"
-                ),
-        },
-
-        "accounts": {
-
-            "last_period_end":
-                last_accounts.get(
-                    "period_end_on"
-                ),
-
-            "last_accounts_type":
-                last_accounts.get(
-                    "type"
-                ),
-
-            "next_accounts_due":
-                next_accounts.get(
-                    "due_on"
-                ),
-
-            "accounts_overdue":
-                next_accounts.get(
-                    "overdue"
-                ),
-        },
-
-        "confirmation_statement": {
-
-            "last_made_up_to":
-                confirmation.get(
-                    "last_made_up_to"
-                ),
-
-            "next_due":
-                confirmation.get(
-                    "next_due"
-                ),
-
-            "overdue":
-                confirmation.get(
-                    "overdue"
-                ),
-        },
-    }
-
-
-# ============================================================
-# 12. OFFICERS
-# ============================================================
-
-def get_officers(
-    company_number,
-):
-    """
-    Retrieve company officers.
-    """
-
-    data = companies_house_get(
-        f"/company/{company_number}/officers"
-    )
-
-    if not data:
-        return []
-
-    return [
-
-        {
-
-            "name":
-                item.get(
-                    "name"
-                ),
-
-            "role":
-                item.get(
-                    "officer_role"
-                ),
-
-            "appointed_on":
-                item.get(
-                    "appointed_on"
-                ),
-
-            "resigned_on":
-                item.get(
-                    "resigned_on"
-                ),
-
-            "nationality":
-                item.get(
-                    "nationality"
-                ),
-
-            "occupation":
-                item.get(
-                    "occupation"
-                ),
-
-            "country_of_residence":
-                item.get(
-                    "country_of_residence"
-                ),
-        }
-
-        for item
-        in data.get(
-            "items",
-            [],
-        )
-    ]
-
-
-# ============================================================
-# 13. PSC
-# ============================================================
-
-def get_pscs(
-    company_number,
-):
-    """
-    Retrieve persons with significant control.
-    """
-
-    data = companies_house_get(
-        f"/company/{company_number}/"
-        "persons-with-significant-control"
-    )
-
-    if not data:
-        return []
-
-    return [
-
-        {
-
-            "name":
-                item.get(
-                    "name"
-                ),
-
-            "kind":
-                item.get(
-                    "kind"
-                ),
-
-            "nature_of_control":
-                item.get(
-                    "natures_of_control",
-                    [],
-                ),
-
-            "notified_on":
-                item.get(
-                    "notified_on"
-                ),
-
-            "ceased_on":
-                item.get(
-                    "ceased_on"
-                ),
-        }
-
-        for item
-        in data.get(
-            "items",
-            [],
-        )
-    ]
-
-
-# ============================================================
-# 14. FILING HISTORY
-# ============================================================
-
-def get_filing_history(
-    company_number,
-    limit=20,
-):
-    """
-    Retrieve recent filing history.
-    """
-
-    data = companies_house_get(
-        f"/company/{company_number}/filing-history",
-
-        params={
-            "items_per_page":
-                limit,
-        },
-    )
-
-    if not data:
-        return []
-
-    results = []
-
-    for item in data.get(
-        "items",
-        [],
-    ):
-
-        links = (
-            item.get(
-                "links"
-            )
-            or {}
-        )
-
-        results.append({
-
-            "date":
-                item.get(
-                    "date"
-                ),
-
-            "type":
-                item.get(
-                    "type"
-                ),
-
-            "description":
-                item.get(
-                    "description"
-                ),
-
-            "category":
-                item.get(
-                    "category"
-                ),
-
-            "action_date":
-                item.get(
-                    "action_date"
-                ),
-
-            "document_metadata":
-                links.get(
-                    "document_metadata"
-                ),
-        })
-
-    return results
-
-
-# ============================================================
-# 15. CHARGES
-# ============================================================
-
-def get_charges(
-    company_number,
-):
-    """
-    Retrieve registered company charges.
-    """
-
-    data = companies_house_get(
-        f"/company/{company_number}/charges"
-    )
-
-    if not data:
-        return []
-
-    return [
-
-        {
-
-            "charge_code":
-                item.get(
-                    "charge_code"
-                ),
-
-            "created_on":
-                item.get(
-                    "created_on"
-                ),
-
-            "delivered_on":
-                item.get(
-                    "delivered_on"
-                ),
-
-            "status":
-                item.get(
-                    "status"
-                ),
-
-            "satisfied_on":
-                item.get(
-                    "satisfied_on"
-                ),
-
-            "particulars":
-                item.get(
-                    "particulars"
-                ),
-
-            "classification":
-                (
-                    item.get(
-                        "classification"
-                    )
-                    or {}
-                ).get(
-                    "description"
-                ),
-        }
-
-        for item
-        in data.get(
-            "items",
-            [],
-        )
-    ]
-
-
-# ============================================================
-# 16. INSOLVENCY
-# ============================================================
-
-def get_insolvency(
-    company_number,
-):
-    """
-    Retrieve insolvency information.
-    """
-
-    data = companies_house_get(
-        f"/company/{company_number}/insolvency"
-    )
-
-    if data is None:
-
-        return {
-            "available":
-                False,
-
-            "cases":
-                [],
-        }
-
-    return {
-
-        "available":
-            True,
-
-        "cases":
-            data.get(
-                "cases",
-                [],
-            ),
-    }
-
-
-# ============================================================
-# 17. DOCUMENT ID
-# ============================================================
-
-def extract_document_id(
-    document_url,
-):
-    """
-    Extract Companies House document ID.
-    """
-
-    path = urlparse(
-        document_url
-    ).path
-
-    parts = [
-        part
-        for part
-        in path.split("/")
-        if part
-    ]
-
-    if "document" not in parts:
-
-        raise ValueError(
-            "Unexpected document metadata URL."
-        )
-
-    index = parts.index(
-        "document"
-    )
-
-    if index + 1 >= len(parts):
-
-        raise ValueError(
-            "Document ID missing."
-        )
-
-    return parts[index + 1]
-
-
-# ============================================================
-# 18. DOCUMENT DOWNLOAD
-# ============================================================
-
-def download_filing_document(
-    document_id,
-):
-    """
-    Download filing PDF.
-    """
-
-    response = requests.get(
-
-        f"{DOC_API_URL}/"
-        f"document/{document_id}/content",
-
-        auth=(
-            require_companies_house_api_key(),
-            "",
-        ),
-
-        headers={
-            "Accept":
-                "application/pdf",
-        },
-
-        allow_redirects=True,
-
-        timeout=60,
-    )
-
-    if not response.ok:
-
-        raise RuntimeError(
-            "Document download failed "
-            f"({response.status_code})"
-        )
-
-    return response.content
-
-
-# ============================================================
-# 19. PDF TEXT EXTRACTION
-# ============================================================
-
-def extract_pdf_chunks(
-    pdf_bytes,
-    company_number,
-    document_id,
-    filing_date,
-    category,
-    chunk_words=420,
-):
-    """
-    Extract page-aware chunks from PDF.
-    """
-
-    document = pymupdf.open(
-        stream=pdf_bytes,
-        filetype="pdf",
-    )
-
-    chunks = []
-
-    try:
-
-        for page_index in range(
-            document.page_count
-        ):
-
-            text = (
-                document
-                .load_page(
-                    page_index
-                )
-                .get_text(
-                    "text"
-                )
-                .strip()
-            )
-
-            if not text:
-                continue
-
-            words = text.split()
-
-            for start in range(
-                0,
-                len(words),
-                chunk_words,
-            ):
-
-                chunk = (
-                    " ".join(
-                        words[
-                            start:
-                            start
-                            + chunk_words
-                        ]
-                    )
-                    .strip()
-                )
-
-                if not chunk:
-                    continue
-
-                chunks.append({
-
-                    "company_number":
-                        company_number,
-
-                    "document_id":
-                        document_id,
-
-                    "category":
-                        category,
-
-                    "filing_date":
-                        filing_date,
-
-                    "page":
-                        page_index + 1,
-
-                    "text":
-                        chunk,
-                })
-
-    finally:
-
-        document.close()
-
-    return chunks
-
-
-# ============================================================
-# 20. TOKENIZATION
-# ============================================================
-
-def tokenize_text(
-    text,
-):
-    """
-    Basic BM25 tokenization.
-    """
-
-    cleaned = re.sub(
-        r"[^a-zA-Z0-9]+",
-        " ",
-        str(text).lower(),
-    )
-
-    return cleaned.split()
-
-
-# ============================================================
-# 21. BUILD RAG INDEX
-# ============================================================
-
-def build_company_rag_index(
-    company_number,
-    max_documents=5,
-):
-    """
-    Build compact hybrid RAG index.
-    """
-
-    filings = (
-        corporate_xray_data.get(
-            "filings"
-        )
-        or []
-    )
-
-    candidates = [
-
-        filing
-        for filing
-        in filings
-
-        if filing.get(
-            "document_metadata"
-        )
-    ]
-
-    priority_types = {
-
-        "AP01",
-        "AP02",
-        "AP03",
-        "AP04",
-
-        "CH01",
-        "CH02",
-        "CH03",
-        "CH04",
-        "CH05",
-
-        "PSC01",
-        "PSC02",
-        "PSC03",
-        "PSC04",
-        "PSC05",
-
-        "CS01",
-    }
-
-    candidates.sort(
-        key=lambda item: (
-            0 if item.get("type") in priority_types else 1,
-            item.get("date") or "",
-        ),
-        reverse=False,
-    )
-
-    # Within each priority group, use the most recent filing first.
-    candidates.sort(
-        key=lambda item: item.get("date") or "",
-        reverse=True,
-    )
-
-    candidates = candidates[
-        :max_documents
-    ]
-
-    chunks = []
-
-    for filing in candidates:
-
-        try:
-
-            document_id = (
-                extract_document_id(
-                    filing[
-                        "document_metadata"
-                    ]
-                )
-            )
-
-            pdf_bytes = (
-                download_filing_document(
-                    document_id
-                )
-            )
-
-            chunks.extend(
-                extract_pdf_chunks(
-                    pdf_bytes,
-
-                    company_number,
-
-                    document_id,
-
-                    filing.get(
-                        "date"
-                    ),
-
-                    filing.get(
-                        "category"
-                    ),
-                )
-            )
-
-        except Exception:
-
-            continue
-
-    if not chunks:
-
-        rag_state.update({
-
-            "company_number":
-                company_number,
-
-            "chunks":
-                [],
-
-            "bm25":
-                None,
-
-            "document_embeddings":
-                None,
-        })
-
-        return 0
-
-    tokenized = [
-
-        tokenize_text(
-            item["text"]
-        )
-
-        for item
-        in chunks
-    ]
-
-    if (
-        rag_state[
-            "embedding_model"
-        ]
-        is None
-    ):
-
-        from sentence_transformers import SentenceTransformer
-
-        rag_state[
-            "embedding_model"
-        ] = SentenceTransformer(
-
-            EMBEDDING_MODEL_ID,
-
-            device="cpu",
-        )
-
-    embeddings = (
-        rag_state[
-            "embedding_model"
-        ].encode(
-
-            [
-                item["text"]
-                for item
-                in chunks
-            ],
-
-            normalize_embeddings=True,
-
-            show_progress_bar=False,
-
-            batch_size=32,
-        )
-    )
-
-    if (
-        rag_state[
-            "reranker"
-        ]
-        is None
-    ):
-
-        from sentence_transformers import CrossEncoder
-
-        rag_state[
-            "reranker"
-        ] = CrossEncoder(
-
-            RERANKER_MODEL_ID,
-
-            device="cpu",
-        )
-
-    rag_state.update({
-
-        "company_number":
-            company_number,
-
-        "chunks":
-            chunks,
-
-        "bm25":
-            BM25Okapi(
-                tokenized
-            ),
-
-        "document_embeddings":
-            np.asarray(
-                embeddings
-            ),
-    })
-
-    return len(chunks)
-
-
-def ensure_company_rag_index(
-    company_number,
-):
-    """
-    Reuse existing RAG index when possible.
-    """
-
-    if (
-        rag_state[
-            "company_number"
-        ]
-        == company_number
-
-        and rag_state[
-            "chunks"
-        ]
-    ):
-
-        return len(
-            rag_state[
-                "chunks"
-            ]
-        )
-
-    return build_company_rag_index(
-        company_number
+input_col, button_col = st.columns(
+    [5.2, 1],
+    gap="medium",
+)
+
+with input_col:
+    company_name = st.text_input(
+        "Company name",
+        value=st.session_state.company_name,
+        placeholder="e.g. REVOLUT LTD",
+    ).strip()
+
+with button_col:
+
+    st.write("")
+
+    run_clicked = st.button(
+        "RUN X-RAY",
+        type="primary",
+        use_container_width=True,
     )
 
 
 # ============================================================
-# 22. HYBRID SEARCH
+# RUN INVESTIGATION
 # ============================================================
 
-def hybrid_search(
-    query,
-    candidate_k=12,
-):
-    """
-    BM25 + semantic retrieval + RRF.
-    """
-
-    chunks = rag_state[
-        "chunks"
-    ]
-
-    if not chunks:
-        return []
-
-    query_tokens = tokenize_text(
-        query
-    )
-
-    bm25_scores = (
-        rag_state[
-            "bm25"
-        ].get_scores(
-            query_tokens
-        )
-    )
-
-    bm25_indices = np.argsort(
-        bm25_scores
-    )[::-1][
-        :candidate_k
-    ]
-
-    query_embedding = (
-        rag_state[
-            "embedding_model"
-        ].encode(
-            query,
-            normalize_embeddings=True,
-        )
-    )
-
-    semantic_scores = np.dot(
-
-        rag_state[
-            "document_embeddings"
-        ],
-
-        query_embedding,
-    )
-
-    semantic_indices = np.argsort(
-        semantic_scores
-    )[::-1][
-        :candidate_k
-    ]
-
-    rrf_scores = {}
-
-    for rank, index in enumerate(
-        bm25_indices
-    ):
-
-        key = int(index)
-
-        rrf_scores[key] = (
-            rrf_scores.get(
-                key,
-                0.0,
-            )
-            + 1.0 / (
-                60
-                + rank
-                + 1
-            )
-        )
-
-    for rank, index in enumerate(
-        semantic_indices
-    ):
-
-        key = int(index)
-
-        rrf_scores[key] = (
-            rrf_scores.get(
-                key,
-                0.0,
-            )
-            + 1.0 / (
-                60
-                + rank
-                + 1
-            )
-        )
-
-    ranked_indices = sorted(
-
-        rrf_scores.items(),
-
-        key=lambda item:
-            item[1],
-
-        reverse=True,
-    )
-
-    candidates = []
-
-    for index, score in ranked_indices:
-
-        item = (
-            rag_state[
-                "chunks"
-            ][index].copy()
-        )
-
-        item[
-            "rrf_score"
-        ] = float(
-            score
-        )
-
-        text_lower = (
-            item["text"].lower()
-        )
-
-        query_lower = (
-            query.lower()
-        )
-
-        boost = 0.0
-
-        if (
-            "director"
-            in query_lower
-
-            or "appointment"
-            in query_lower
-        ):
-
-            if (
-                "appointment of director"
-                in text_lower
-            ):
-                boost += 4.0
-
-            if (
-                "date of appointment"
-                in text_lower
-            ):
-                boost += 3.0
-
-        if (
-            "ownership"
-            in query_lower
-
-            or "control"
-            in query_lower
-
-            or "psc"
-            in query_lower
-        ):
-
-            if (
-                "significant control"
-                in text_lower
-            ):
-                boost += 4.0
-
-        item[
-            "combined_score"
-        ] = (
-            score + boost
-        )
-
-        candidates.append(
-            item
-        )
-
-    candidates.sort(
-
-        key=lambda item:
-            item[
-                "combined_score"
-            ],
-
-        reverse=True,
-    )
-
-    candidates = candidates[
-        :candidate_k
-    ]
-
-    if not candidates:
-        return []
-
-    pairs = [
-
-        [
-            query,
-            item["text"],
-        ]
-
-        for item
-        in candidates
-    ]
-
-    scores = (
-        rag_state[
-            "reranker"
-        ].predict(
-            pairs
-        )
-    )
-
-    for item, score in zip(
-        candidates,
-        scores,
-    ):
-
-        item[
-            "reranker_score"
-        ] = float(
-            score
-        )
-
-    candidates.sort(
-
-        key=lambda item:
-            item[
-                "reranker_score"
-            ],
-
-        reverse=True,
-    )
-
-    final_results = []
-
-    seen = set()
-
-    for item in candidates:
-
-        key = (
-
-            item.get(
-                "document_id"
-            ),
-
-            item.get(
-                "page"
-            ),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        final_results.append({
-
-            "company_number":
-                item.get(
-                    "company_number"
-                ),
-
-            "document_id":
-                item.get(
-                    "document_id"
-                ),
-
-            "category":
-                item.get(
-                    "category"
-                ),
-
-            "filing_date":
-                item.get(
-                    "filing_date"
-                ),
-
-            "page":
-                item.get(
-                    "page"
-                ),
-
-            "score":
-                item.get(
-                    "reranker_score"
-                ),
-
-            "evidence":
-                item.get(
-                    "text",
-                    "",
-                )[
-                    :2500
-                ],
-        })
-
-        if len(
-            final_results
-        ) >= 3:
-
-            break
-
-    return final_results
-
-
-# ============================================================
-# 23. TOOL 1 — COMPANY SEARCH
-# ============================================================
-@tool
-def company_search(query: str) -> dict:
-    """
-    Search Companies House for a UK company.
-
-    Args:
-        query: Company name or search term to search on Companies House.
-
-    Returns:
-        The selected company name and company number.
-    """
-    query = str(query).strip()
-
-    if not query:
-        return {
-            "status": "error",
-            "message": "Company name is required.",
-        }
-
-    # Use the actual Companies House API helper defined above.
-    results = search_company_api(query, limit=10)
-
-    if not results:
-        return {
-            "status": "not_found",
-            "query": query,
-            "message": f"No Companies House result found for '{query}'.",
-        }
-
-    query_normalized = query.upper()
-
-    exact_matches = []
-    other_matches = []
-
-    for item in results:
-        name = (
-            item.get("company_name") or ""
-        ).strip().upper()
-
-        if name == query_normalized:
-            exact_matches.append(item)
-        else:
-            other_matches.append(item)
-
-    # Prefer exact active matches, then other active matches.
-    exact_matches.sort(
-        key=lambda item: item.get("company_status") != "active"
-    )
-    other_matches.sort(
-        key=lambda item: item.get("company_status") != "active"
-    )
-
-    matches = exact_matches[:3] + other_matches[:2]
-
-    selected = exact_matches[0] if exact_matches else matches[0]
-
-    selected_name = selected.get("company_name")
-    selected_number = selected.get("company_number")
-
-    if not selected_number:
-        return {
-            "status": "error",
-            "query": query,
-            "message": "Companies House returned a result without a company number.",
-            "matches": matches,
-        }
-
-    corporate_xray_state["selected_company_name"] = selected_name
-    corporate_xray_state["selected_company_number"] = selected_number
-    corporate_xray_data["company_search"] = {
-        "query": query,
-        "matches": matches,
-        "selected_company_name": selected_name,
-        "selected_company_number": selected_number,
-    }
-    corporate_xray_state["company_search_completed"] = True
-
-    # Move to the next guarded stage.
-    advance_stage("company_search")
-
-    return {
-        "status": "success",
-        "query": query,
-        "selected_company_name": selected_name,
-        "selected_company_number": selected_number,
-        "matches": matches,
-        "next_stage": corporate_xray_state["current_stage"],
-    }
-
-# ============================================================
-# 24. TOOL 2 — COMPANY PROFILE
-# ============================================================
-
-@tool
-def company_profile() -> dict:
-    """
-    Retrieve the selected company's official profile.
-
-    Returns:
-        Company profile summary.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_profile"
-    ):
-
-        return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
-        }
-
-    company_number = (
-        current_company_number()
-    )
-
-    result = get_company_profile(
-        company_number
-    )
-
-    corporate_xray_data[
-        "company_profile"
-    ] = result
-
-    corporate_xray_state[
-        "company_profile_completed"
-    ] = True
-
-    advance_stage(
-        "company_profile"
-    )
-
-    return {
-
-        "status":
-            "completed",
-
-        "company_name":
-            result.get(
-                "company_name"
-            ),
-
-        "company_number":
-            result.get(
-                "company_number"
-            ),
-
-        "company_status":
-            result.get(
-                "company_status"
-            ),
-
-        "company_type":
-            result.get(
-                "company_type"
-            ),
-
-        "date_of_creation":
-            result.get(
-                "date_of_creation"
-            ),
-
-        "jurisdiction":
-            result.get(
-                "jurisdiction"
-            ),
-
-        "sic_codes":
-            result.get(
-                "sic_codes",
-                [],
-            ),
-    }
-
-
-# ============================================================
-# 25. TOOL 3 — OFFICERS
-# ============================================================
-
-@tool
-def company_officers() -> dict:
-    """
-    Retrieve officers of the selected company.
-
-    Returns:
-        Officer counts and sample records.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_officers"
-    ):
-
-        return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
-        }
-
-    result = get_officers(
-        current_company_number()
-    )
-
-    corporate_xray_data[
-        "officers"
-    ] = result
-
-    corporate_xray_state[
-        "officers_completed"
-    ] = True
-
-    current = [
-
-        item
-
-        for item
-        in result
-
-        if not item.get(
-            "resigned_on"
-        )
-    ]
-
-    advance_stage(
-        "company_officers"
-    )
-
-    return {
-
-        "status":
-            "completed",
-
-        "total_officers":
-            len(result),
-
-        "current_officers":
-            len(current),
-
-        "current_officer_sample":
-            current[:6],
-    }
-
-
-# ============================================================
-# 26. TOOL 4 — PSC
-# ============================================================
-
-@tool
-def company_pscs() -> dict:
-    """
-    Retrieve persons with significant control.
-
-    Returns:
-        PSC count and sample records.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_pscs"
-    ):
-
-        return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
-        }
-
-    result = get_pscs(
-        current_company_number()
-    )
-
-    corporate_xray_data[
-        "pscs"
-    ] = result
-
-    corporate_xray_state[
-        "pscs_completed"
-    ] = True
-
-    advance_stage(
-        "company_pscs"
-    )
-
-    return {
-
-        "status":
-            "completed",
-
-        "total_pscs":
-            len(result),
-
-        "psc_sample":
-            result[:6],
-    }
-
-
-# ============================================================
-# 27. TOOL 5 — FILINGS
-# ============================================================
-
-@tool
-def company_filings() -> dict:
-    """
-    Retrieve recent filing history.
-
-    Returns:
-        Filing count and recent filings.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_filings"
-    ):
-
-        return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
-        }
-
-    result = get_filing_history(
-        current_company_number(),
-        20,
-    )
-
-    corporate_xray_data[
-        "filings"
-    ] = result
-
-    corporate_xray_state[
-        "filings_completed"
-    ] = True
-
-    advance_stage(
-        "company_filings"
-    )
-
-    return {
-
-        "status":
-            "completed",
-
-        "filings_retrieved":
-            len(result),
-
-        "recent_filings":
-            result[:8],
-    }
-
-
-# ============================================================
-# 28. TOOL 6 — CHARGES
-# ============================================================
-
-@tool
-def company_charges() -> dict:
-    """
-    Retrieve registered charges.
-
-    Returns:
-        Charge count and statuses.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_charges"
-    ):
-
-        return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
-        }
-
-    result = get_charges(
-        current_company_number()
-    )
-
-    corporate_xray_data[
-        "charges"
-    ] = result
-
-    corporate_xray_state[
-        "charges_completed"
-    ] = True
-
-    status_counts = {}
-
-    for item in result:
-
-        status = (
-            item.get(
-                "status"
-            )
-            or "unknown"
-        )
-
-        status_counts[
-            status
-        ] = (
-            status_counts.get(
-                status,
-                0,
-            )
-            + 1
-        )
-
-    advance_stage(
-        "company_charges"
-    )
-
-    return {
-
-        "status":
-            "completed",
-
-        "charges_retrieved":
-            len(result),
-
-        "status_counts":
-            status_counts,
-
-        "recent_charges":
-            result[:6],
-    }
-
-
-# ============================================================
-# 29. TOOL 7 — INSOLVENCY
-# ============================================================
-
-@tool
-def company_insolvency() -> dict:
-    """
-    Retrieve insolvency information.
-
-    Returns:
-        Insolvency availability and case count.
-    """
-
-    if (
-        corporate_xray_state[
-            "current_stage"
-        ]
-        != "company_insolvency"
-    ):
-
-        return {
-
-            "status":
-                "blocked",
-
-            "required_stage":
-                corporate_xray_state[
-                    "current_stage"
-                ],
-        }
-
-    result = get_insolvency(
-        current_company_number()
-    )
-
-    corporate_xray_data[
-        "insolvency"
-    ] = result
-
-    corporate_xray_state[
-        "insolvency_completed"
-    ] = True
-
-    advance_stage(
-        "company_insolvency"
-    )
-
-    return {
-
-        "status":
-            "completed",
-
-        "available":
-            result.get(
-                "available",
-                False,
-            ),
-
-        "case_count":
-            len(
-                result.get(
-                    "cases",
-                    [],
-                )
-            ),
-    }
-
-
-# ============================================================
-# 30. TOOL 8 — SEARCH DOCUMENTARY EVIDENCE
-# ============================================================
-@tool
-def search_company_evidence(query: str) -> list:
-    """
-    Search official Companies House filing documents using hybrid RAG
-    and reranking.
-
-    Args:
-        query: Natural-language question describing the documentary
-            evidence that should be retrieved.
-
-    Returns:
-        A list of ranked documentary evidence records.
-    """
-    if corporate_xray_state["current_stage"] != "search_company_evidence":
-        return [
-            {
-                "status": "blocked",
-                "required_stage": corporate_xray_state["current_stage"],
-            }
-        ]
-
-    query = str(query).strip()
-
-    if not query:
-        query = corporate_xray_state.get(
-            "default_evidence_query",
-            "",
-        ).strip()
-
-    if not query:
-        return [
-            {
-                "status": "error",
-                "message": "A documentary evidence query is required.",
-            }
-        ]
-
-    company_number = current_company_number()
-
-    attempt = corporate_xray_state.get("evidence_attempts", 0) + 1
-    corporate_xray_state["evidence_attempts"] = attempt
-    corporate_xray_state["evidence_queries"].append(query)
-
-    try:
-        chunk_count = ensure_company_rag_index(company_number)
-
-        if not chunk_count:
-            corporate_xray_state["evidence_completed"] = True
-            corporate_xray_state["current_stage"] = "final_answer"
-            return [
-                {
-                    "status": "no_evidence",
-                    "company_number": company_number,
-                    "message": (
-                        "No documentary evidence is available "
-                        "for the selected company."
-                    ),
-                    "attempt": attempt,
-                }
-            ]
-
-        # hybrid_search already performs:
-        # BM25 + dense retrieval + RRF + BGE reranking.
-        results = hybrid_search(
-            query,
-            candidate_k=8,
-        )
-
-        normalized = [
-            {
-                "company_number": company_number,
-                "document_id": item.get("document_id"),
-                "category": item.get("category"),
-                "filing_date": item.get("filing_date"),
-                "page": item.get("page"),
-                "score": item.get("reranker_score"),
-                "evidence": item.get("evidence", ""),
-            }
-            for item in results
-        ]
-
-        # Keep all unique evidence across attempts.
-        existing_keys = {
-            (
-                item.get("document_id"),
-                item.get("page"),
-                item.get("evidence"),
-            )
-            for item in corporate_xray_evidence
-        }
-
-        for item in normalized:
-            key = (
-                item.get("document_id"),
-                item.get("page"),
-                item.get("evidence"),
-            )
-            if key not in existing_keys:
-                corporate_xray_evidence.append(item)
-
-        corporate_xray_state["evidence_sufficient"] = bool(normalized)
-        corporate_xray_state["evidence_completed"] = bool(normalized)
-
-        # The agent may either accept the evidence and finish or
-        # request another search. Hard cap prevents infinite loops.
-        if attempt >= MAX_EVIDENCE_ATTEMPTS:
-            corporate_xray_state["evidence_completed"] = True
-            corporate_xray_state["current_stage"] = "final_answer"
-
-        return normalized
-
-    except Exception as exc:
-        if attempt >= MAX_EVIDENCE_ATTEMPTS:
-            corporate_xray_state["evidence_completed"] = True
-            corporate_xray_state["current_stage"] = "final_answer"
-
-        return [
-            {
-                "status": "error",
-                "company_number": company_number,
-                "attempt": attempt,
-                "message": f"Evidence retrieval failed: {exc}",
-            }
-        ]
-
-
-# ============================================================
-# 31. FINAL ANSWER VALIDATION
-# ============================================================
-
-def investigation_complete(final_answer, memory, agent=None):
-    """Reject final answers until structured data and evidence are available."""
-    required_flags = [
-        "company_search_completed",
-        "company_profile_completed",
-        "officers_completed",
-        "pscs_completed",
-        "filings_completed",
-        "charges_completed",
-        "insolvency_completed",
-    ]
-    missing = [
-        key for key in required_flags
-        if not corporate_xray_state.get(key, False)
-    ]
-
-    if missing:
-        raise ValueError(
-            "Investigation incomplete. Missing steps: " + ", ".join(missing)
-        )
-
-    if not corporate_xray_state.get("selected_company_number"):
-        raise ValueError(
-            "FINAL ANSWER REJECTED: no verified company number is available."
-        )
-
-    if not corporate_xray_state.get("evidence_attempts", 0):
-        raise ValueError(
-            "FINAL ANSWER REJECTED: documentary evidence search has not been attempted."
-        )
-
-    if not corporate_xray_evidence and not corporate_xray_state.get("evidence_completed"):
-        raise ValueError(
-            "FINAL ANSWER REJECTED: no documentary evidence was retrieved."
-        )
-
-    corporate_xray_state["evidence_completed"] = True
-    return True
-
-
-# ============================================================
-# 32. LOCAL QWEN MODEL ADAPTER
-# ============================================================
-
-class LocalQwenModel(Model):
-    """
-    Qwen local adapter for smolagents.
-
-    The model only receives the tool that is valid for the
-    current workflow stage. This prevents the earlier:
-      - wrong arguments
-      - repeated tools
-      - premature final answers
-      - out-of-order calls
-    """
-
-    def __init__(
-        self,
-        model,
-        tokenizer,
-        max_new_tokens=96,
-    ):
-
-        super().__init__(
-
-            model_id=
-                MODEL_ID,
-
-            max_new_tokens=
-                max_new_tokens,
-        )
-
-        self.model = model
-        self.tokenizer = tokenizer
-        self.max_new_tokens = (
-            max_new_tokens
-        )
-
-    def _prepare_messages(
-        self,
-        messages,
-    ):
-        """
-        Convert smolagents messages to Qwen chat format.
-        """
-
-        prepared = []
-
-        for message in messages:
-
-            if isinstance(
-                message,
-                ChatMessage,
-            ):
-
-                role = (
-                    message.role.value
-                )
-
-                content = (
-                    message.content
-                )
-
-            else:
-
-                role = message.get(
-                    "role",
-                    "user",
-                )
-
-                content = message.get(
-                    "content",
-                    "",
-                )
-
-            if isinstance(
-                content,
-                list,
-            ):
-
-                parts = []
-
-                for item in content:
-
-                    if (
-                        isinstance(
-                            item,
-                            dict,
-                        )
-                        and item.get(
-                            "type"
-                        ) == "text"
-                    ):
-
-                        parts.append(
-                            str(
-                                item.get(
-                                    "text",
-                                    "",
-                                )
-                            )
-                        )
-
-                content = "\n".join(
-                    parts
-                )
-
-            if role == "tool-response":
-
-                role = "user"
-
-                content = (
-                    "<tool_response>\n"
-                    + str(content)[
-                        -1800:
-                    ]
-                    + "\n</tool_response>"
-                )
-
-            elif role == "tool-call":
-
-                role = "assistant"
-
-            prepared.append({
-
-                "role":
-                    role,
-
-                "content":
-                    str(
-                        content
-                    )[
-                        -1800:
-                    ],
-            })
-
-        return prepared
-
-    def _make_tool_call(
-        self,
-        generated_text,
-    ):
-        """Parse a Qwen tool call with safe stage-aware fallbacks."""
-        stage = corporate_xray_state["current_stage"]
-
-        match = re.search(
-            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
-            generated_text,
-            re.DOTALL,
-        )
-
-        if match:
-            try:
-                payload = json.loads(match.group(1))
-                if isinstance(payload, dict) and payload.get("name"):
-                    name = payload["name"]
-                    arguments = payload.get("arguments", {})
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-
-                    valid_names = {stage}
-                    if stage == "search_company_evidence":
-                        valid_names.add("final_answer")
-
-                    if name in valid_names:
-                        if name == "company_search" and not arguments.get("query"):
-                            arguments["query"] = corporate_xray_state.get("investigation_question", "")
-                        if name == "search_company_evidence" and not arguments.get("query"):
-                            arguments["query"] = corporate_xray_state.get("default_evidence_query", "")
-                        return {"name": name, "arguments": arguments}
-            except Exception:
-                pass
-
-        if stage == "final_answer":
-            return {
-                "name": "final_answer",
-                "arguments": {
-                    "answer": generated_text.strip() or "Investigation completed.",
-                },
-            }
-
-        if stage == "search_company_evidence":
-            if corporate_xray_state.get("evidence_attempts", 0) >= MAX_EVIDENCE_ATTEMPTS:
-                return {
-                    "name": "final_answer",
-                    "arguments": {
-                        "answer": generated_text.strip() or "Investigation completed.",
-                    },
-                }
-            return {
-                "name": "search_company_evidence",
-                "arguments": {
-                    "query": corporate_xray_state.get("default_evidence_query", "")
-                },
-            }
-
-        fallback_args = {}
-        if stage == "company_search":
-            fallback_args["query"] = corporate_xray_state.get("investigation_question", "")
-
-        return {"name": stage, "arguments": fallback_args}
-
-    def generate(
-        self,
-        messages,
-        stop_sequences=None,
-        response_format=None,
-        tools_to_call_from=None,
-        **kwargs,
-    ):
-        """
-        Generate a single agent action.
-        """
-
-        prepared = (
-            self._prepare_messages(
-                messages
-            )
-        )
-
-        stage = (
-            corporate_xray_state[
-                "current_stage"
-            ]
-        )
-
-        allowed_tools = []
-        for candidate in (tools_to_call_from or []):
-            if candidate.name == stage:
-                allowed_tools.append(candidate)
-            elif stage == "search_company_evidence" and candidate.name == "final_answer":
-                allowed_tools.append(candidate)
-
-        tool_schemas = [
-
-            get_tool_json_schema(
-                tool_obj
-            )
-
-            for tool_obj
-            in allowed_tools
-        ]
-
-        inputs = (
-            self.tokenizer
-            .apply_chat_template(
-
-                prepared,
-
-                tools=
-                    tool_schemas,
-
-                add_generation_prompt=
-                    True,
-
-                tokenize=
-                    True,
-
-                return_dict=
-                    True,
-
-                return_tensors=
-                    "pt",
-            )
-        )
-
-        model_device = (
-            self.model.device
-        )
-
-        inputs = {
-
-            key:
-                value.to(
-                    model_device
-                )
-
-            for key, value
-            in inputs.items()
-        }
-
-        prompt_length = (
-            inputs[
-                "input_ids"
-            ].shape[-1]
-        )
-
-        max_new_tokens = int(
-
-            kwargs.get(
-
-                "max_new_tokens",
-
-                self.max_new_tokens,
-            )
-        )
-
-        import torch
-
-        with torch.inference_mode():
-
-            outputs = (
-                self.model.generate(
-
-                    **inputs,
-
-                    max_new_tokens=
-                        max_new_tokens,
-
-                    do_sample=
-                        False,
-
-                    use_cache=
-                        True,
-
-                    pad_token_id=
-                        self.tokenizer
-                        .eos_token_id,
-                )
-            )
-
-        generated_tokens = (
-            outputs[0][
-                prompt_length:
-            ]
-        )
-
-        generated_text = (
-            self.tokenizer.decode(
-
-                generated_tokens,
-
-                skip_special_tokens=
-                    True,
-            )
-            .strip()
-        )
-
-        payload = (
-            self._make_tool_call(
-                generated_text
-            )
-        )
-
-        return ChatMessage(
-
-            role=
-                MessageRole.ASSISTANT,
-
-            content=(
-                "<tool_call>\n"
-                + json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                )
-                + "\n</tool_call>"
-            ),
-        )
-
-
-# ============================================================
-# 33. LOAD LOCAL QWEN
-# ============================================================
-
-def load_qwen():
-    """
-    Load Qwen2.5-3B.
-
-    CUDA is preferred.
-    4-bit NF4 is used on NVIDIA GPU.
-    CPU fallback is available for environments without CUDA.
-    """
-
-    import torch
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        BitsAndBytesConfig,
-    )
-
-    global _qwen_model
-    global _qwen_tokenizer
-
-    if (
-        _qwen_model is not None
-        and _qwen_tokenizer is not None
-    ):
-
-        return (
-            _qwen_model,
-            _qwen_tokenizer,
-        )
-
-    if DEPLOYMENT_MODE != "local":
-        raise RuntimeError(
-            "Local Qwen loading is disabled in cloud mode. "
-            "Use the pinned OpenAI-compatible Hugging Face router for deployed inference."
-        )
-
-    tokenizer = (
-        AutoTokenizer.from_pretrained(
-
-            MODEL_ID,
-
-            token=(
-                HF_TOKEN
-                or None
-            ),
-        )
-    )
-
-    # --------------------------------------------------------
-    # NVIDIA CUDA PATH
-    # --------------------------------------------------------
-
-    if torch.cuda.is_available():
-
-        quant_config = (
-            BitsAndBytesConfig(
-
-                load_in_4bit=
-                    True,
-
-                bnb_4bit_quant_type=
-                    "nf4",
-
-                bnb_4bit_compute_dtype=
-                    torch.float16,
-
-                bnb_4bit_use_double_quant=
-                    True,
-            )
-        )
-
-        model = (
-            AutoModelForCausalLM
-            .from_pretrained(
-
-                MODEL_ID,
-
-                token=(
-                    HF_TOKEN
-                    or None
-                ),
-
-                device_map=
-                    "auto",
-
-                torch_dtype=
-                    torch.float16,
-
-                quantization_config=
-                    quant_config,
-
-                attn_implementation=
-                    "sdpa",
-            )
-        )
-
-    # --------------------------------------------------------
-    # CPU FALLBACK
-    # --------------------------------------------------------
-
-    else:
-
-        model = (
-            AutoModelForCausalLM
-            .from_pretrained(
-
-                MODEL_ID,
-
-                token=(
-                    HF_TOKEN
-                    or None
-                ),
-
-                device_map=
-                    "cpu",
-
-                torch_dtype=
-                    torch.float32,
-            )
-        )
-
-    _qwen_model = model
-    _qwen_tokenizer = tokenizer
-
-    return (
-        _qwen_model,
-        _qwen_tokenizer,
-    )
-
-
-# ============================================================
-# 34. RESILIENT CLOUD MODEL + CREATE THE ONE AGENT
-# ============================================================
-
-class ResilientHFModel(Model):
-    """Provider-resilient Hugging Face model wrapper."""
-
-    def __init__(self, primary, fallback):
-        super().__init__(
-            model_id=f"{CLOUD_PRIMARY_MODEL_ID} -> {CLOUD_FALLBACK_MODEL_ID}"
-        )
-        self.primary = primary
-        self.fallback = fallback
-
-    @staticmethod
-    def _is_transient(exc):
-        text = str(exc).lower()
-        status = getattr(exc, "status_code", None)
-        response = getattr(exc, "response", None)
-        if status is None and response is not None:
-            status = getattr(response, "status_code", None)
-
-        try:
-            if int(status) in {408, 409, 425, 429, 500, 502, 503, 504}:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-        return any(
-            marker in text
-            for marker in (
-                "timeout",
-                "timed out",
-                "temporarily unavailable",
-                "service unavailable",
-                "server error",
-                "connection error",
-                "connection reset",
-                "connection aborted",
-                "rate limit",
-                "too many requests",
-            )
-        )
-
-    def _call(self, model, messages, stop_sequences, response_format,
-              tools_to_call_from, kwargs):
-        return model.generate(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            **kwargs,
-        )
-
-    def _try_provider(self, model, label, messages, stop_sequences,
-                      response_format, tools_to_call_from, kwargs):
-        last_error = None
-
-        for attempt, delay in enumerate((0, 2), start=1):
-            if delay:
-                time.sleep(delay)
-
-            try:
-                return self._call(
-                    model,
-                    messages,
-                    stop_sequences,
-                    response_format,
-                    tools_to_call_from,
-                    kwargs,
-                )
-            except Exception as exc:
-                last_error = exc
-                if attempt == 1 and not self._is_transient(exc):
-                    break
-
-        raise RuntimeError(f"{label} failed: {last_error}") from last_error
-
-    def generate(
-        self,
-        messages,
-        stop_sequences=None,
-        response_format=None,
-        tools_to_call_from=None,
-        **kwargs,
-    ):
-        try:
-            return self._try_provider(
-                self.primary,
-                "Primary provider (Nscale)",
-                messages,
-                stop_sequences,
-                response_format,
-                tools_to_call_from,
-                kwargs,
-            )
-        except Exception as primary_error:
-            try:
-                return self._try_provider(
-                    self.fallback,
-                    "Fallback provider (DeepInfra)",
-                    messages,
-                    stop_sequences,
-                    response_format,
-                    tools_to_call_from,
-                    kwargs,
-                )
-            except Exception as fallback_error:
-                raise RuntimeError(
-                    "Cloud inference failed on both Hugging Face providers. "
-                    f"Primary: {primary_error}. "
-                    f"Fallback: {fallback_error}"
-                ) from fallback_error
-
-
-def get_corporate_xray_agent():
-    """Build the single Corporate X-Ray agent for local or cloud inference."""
-    global _agent
-
-    if _agent is not None:
-        return _agent
-
-    if DEPLOYMENT_MODE == "cloud":
-        if not HF_TOKEN:
-            raise RuntimeError(
-                "HF_TOKEN is required when CORPORATE_XRAY_DEPLOYMENT=cloud."
-            )
-
-        # Hugging Face exposes an OpenAI-compatible router at /v1.
-        # The model suffix pins the provider. `tool_choice="auto"` is
-        # required because the current Nscale route does not accept
-        # smolagents 1.26.0's default `required` tool choice.
-        primary = OpenAIModel(
-            model_id=CLOUD_PRIMARY_MODEL_ID,
-            api_base=HF_ROUTER_BASE_URL,
-            api_key=HF_TOKEN,
-            temperature=0.0,
-            max_tokens=512,
-            tool_choice="auto",
-            client_kwargs={
-                "timeout": 120.0,
-                "max_retries": 0,
-            },
-        )
-
-        fallback = OpenAIModel(
-            model_id=CLOUD_FALLBACK_MODEL_ID,
-            api_base=HF_ROUTER_BASE_URL,
-            api_key=HF_TOKEN,
-            temperature=0.0,
-            max_tokens=512,
-            tool_choice="auto",
-            client_kwargs={
-                "timeout": 120.0,
-                "max_retries": 0,
-            },
-        )
-
-        model = ResilientHFModel(primary, fallback)
-    elif DEPLOYMENT_MODE == "local":
-        model_weights, tokenizer = load_qwen()
-        model = LocalQwenModel(
-            model=model_weights,
-            tokenizer=tokenizer,
-            max_new_tokens=96,
-        )
-    else:
-        raise RuntimeError(
-            "CORPORATE_XRAY_DEPLOYMENT must be 'local' or 'cloud'."
-        )
-
-    xray_tools = [
-        company_search,
-        company_profile,
-        company_officers,
-        company_pscs,
-        company_filings,
-        company_charges,
-        company_insolvency,
-        search_company_evidence,
-    ]
-
-    assert len(xray_tools) == 8
-
-    _agent = ToolCallingAgent(
-        tools=xray_tools,
-        model=model,
-        max_steps=12,
-        verbosity_level=1,
-        final_answer_checks=[investigation_complete],
-    )
-
-    return _agent
-
-
-# ============================================================
-# 35. MANAGEMENT ANALYSIS
-# ============================================================
-
-def analyze_management():
-
-    officers = (
-        corporate_xray_data.get(
-            "officers"
-        )
-        or []
-    )
-
-    appointments = [
-
-        {
-
-            "name":
-                item.get(
-                    "name"
-                ),
-
-            "role":
-                item.get(
-                    "role"
-                ),
-
-            "appointed_on":
-                item.get(
-                    "appointed_on"
-                ),
-        }
-
-        for item
-        in officers
-
-        if item.get(
-            "appointed_on"
-        )
-    ]
-
-    resignations = [
-
-        {
-
-            "name":
-                item.get(
-                    "name"
-                ),
-
-            "role":
-                item.get(
-                    "role"
-                ),
-
-            "resigned_on":
-                item.get(
-                    "resigned_on"
-                ),
-        }
-
-        for item
-        in officers
-
-        if item.get(
-            "resigned_on"
-        )
-    ]
-
-    appointments.sort(
-
-        key=lambda item:
-            item.get(
-                "appointed_on"
-            )
-            or "",
-
-        reverse=True,
-    )
-
-    resignations.sort(
-
-        key=lambda item:
-            item.get(
-                "resigned_on"
-            )
-            or "",
-
-        reverse=True,
-    )
-
-    return {
-
-        "total_officers":
-            len(
-                officers
-            ),
-
-        "recent_appointments":
-            appointments[:10],
-
-        "recent_resignations":
-            resignations[:10],
-    }
-
-
-# ============================================================
-# 36. FILING ANALYSIS
-# ============================================================
-
-def analyze_filings():
-
-    filings = (
-        corporate_xray_data.get(
-            "filings"
-        )
-        or []
-    )
-
-    type_counts = {}
-
-    for item in filings:
-
-        filing_type = (
-            item.get(
-                "type"
-            )
-            or "UNKNOWN"
-        )
-
-        type_counts[
-            filing_type
-        ] = (
-            type_counts.get(
-                filing_type,
-                0,
-            )
-            + 1
-        )
-
-    return {
-
-        "total_filings":
-            len(filings),
-
-        "type_counts":
-            type_counts,
-
-        "recent_filings":
-            filings[:10],
-    }
-
-
-# ============================================================
-# 37. CHARGES ANALYSIS
-# ============================================================
-
-def analyze_charges():
-
-    charges = (
-        corporate_xray_data.get(
-            "charges"
-        )
-        or []
-    )
-
-    status_counts = {}
-
-    for item in charges:
-
-        status = (
-            item.get(
-                "status"
-            )
-            or "unknown"
-        )
-
-        status_counts[
-            status
-        ] = (
-            status_counts.get(
-                status,
-                0,
-            )
-            + 1
-        )
-
-    return {
-
-        "total_charges":
-            len(charges),
-
-        "status_counts":
-            status_counts,
-
-        "recent_charges":
-            charges[:10],
-    }
-
-
-# ============================================================
-# 38. FINAL REPORT
-# ============================================================
-
-def build_corporate_xray_report():
-
-    profile = (
-        corporate_xray_data.get(
-            "company_profile"
-        )
-        or {}
-    )
-
-    pscs = (
-        corporate_xray_data.get(
-            "pscs"
-        )
-        or []
-    )
-
-    insolvency = (
-        corporate_xray_data.get(
-            "insolvency"
-        )
-        or {}
-    )
-
-    return {
-
-        "company_overview": {
-
-            "name":
-                profile.get(
-                    "company_name"
-                ),
-
-            "number":
-                profile.get(
-                    "company_number"
-                ),
-
-            "status":
-                profile.get(
-                    "company_status"
-                ),
-
-            "type":
-                profile.get(
-                    "company_type"
-                ),
-
-            "created":
-                profile.get(
-                    "date_of_creation"
-                ),
-
-            "jurisdiction":
-                profile.get(
-                    "jurisdiction"
-                ),
-
-            "sic_codes":
-                profile.get(
-                    "sic_codes",
-                    [],
-                ),
-        },
-
-        "management":
-            analyze_management(),
-
-        "ownership": {
-
-            "psc_count":
-                len(pscs),
-
-            "psc_records":
-                pscs[:10],
-        },
-
-        "filing_activity":
-            analyze_filings(),
-
-        "charges":
-            analyze_charges(),
-
-        "insolvency": {
-
-            "information_available":
-                insolvency.get(
-                    "available",
-                    False,
-                ),
-
-            "case_count":
-                len(
-                    insolvency.get(
-                        "cases",
-                        [],
-                    )
-                ),
-        },
-
-        "documentary_evidence":
-            corporate_xray_evidence[:5],
-    }
-
-
-# ============================================================
-# 39. MAIN APPLICATION ENTRY
-# ============================================================
-
-def run_corporate_xray(
-    company_name,
-):
-    """
-    Run complete one-agent Corporate X-Ray investigation.
-    """
-
-    company_name = (
-        str(company_name)
-        .strip()
-    )
+if run_clicked:
 
     if not company_name:
 
-        raise ValueError(
-            "Company name cannot be empty."
+        st.session_state.investigation_result = None
+        st.session_state.investigation_error = (
+            "Please enter a UK company name."
         )
 
-    reset_corporate_xray_state()
-    corporate_xray_state["investigation_question"] = company_name
-    corporate_xray_state["default_evidence_query"] = (
-        f"Recent Companies House documentary evidence for {company_name}: "
-        "director appointments or changes, ownership or PSC changes, "
-        "filing activity, registered charges, and insolvency-related filings."
+    else:
+
+        st.session_state.company_name = company_name
+        st.session_state.investigation_result = None
+        st.session_state.investigation_error = None
+
+        with st.status(
+            f"Running Corporate X-Ray for {company_name}...",
+            expanded=True,
+        ) as status:
+
+            try:
+
+                st.write(
+                    "Connecting to official Companies House data..."
+                )
+
+                result = backend.run_corporate_xray(
+                    company_name
+                )
+
+                st.session_state.investigation_result = result
+
+                status.update(
+                    label="✓ Investigation completed",
+                    state="complete",
+                    expanded=False,
+                )
+
+            except Exception as exc:
+
+                st.session_state.investigation_error = str(
+                    exc
+                )
+
+                status.update(
+                    label="Investigation failed",
+                    state="error",
+                    expanded=True,
+                )
+
+
+# ============================================================
+# ERROR
+# ============================================================
+
+if st.session_state.investigation_error:
+
+    st.error(
+        st.session_state.investigation_error
     )
-    corporate_xray_state["started_at"] = __import__("time").time()
 
-    agent = get_corporate_xray_agent()
 
-    prompt = f"""
-Perform a complete Corporate X-Ray investigation of:
+# ============================================================
+# RESULT
+# ============================================================
 
-{company_name}
+result = st.session_state.investigation_result
 
-Follow the investigation workflow in order:
+if result:
 
-1. company_search
-2. company_profile
-3. company_officers
-4. company_pscs
-5. company_filings
-6. company_charges
-7. company_insolvency
-8. search_company_evidence
-9. final_answer
+    report = result.get("report", {}) or {}
+    state = result.get("state", {}) or {}
+    evidence = result.get("evidence", []) or []
 
-Rules:
+    company = report.get(
+        "company_overview",
+        {},
+    ) or {}
 
-- Identify the exact requested UK legal company.
-- Use the exact company number returned by company_search.
-- Never substitute a different company.
-- Complete every structured investigation stage.
-- Use official Companies House observations.
-- After structured collection, use search_company_evidence.
-- Evaluate whether the retrieved documentary evidence actually supports the investigative finding.
-- If the evidence is insufficient, reformulate the query and search again.
-- You may perform at most 3 evidence searches.
-- Do not invent facts.
-- Clearly distinguish missing information from confirmed information.
-- Keep the final report factual and evidence-grounded.
-"""
+    management = report.get(
+        "management",
+        {},
+    ) or {}
 
-    result = agent.run(
-        prompt
+    ownership = report.get(
+        "ownership",
+        {},
+    ) or {}
+
+    filing_activity = report.get(
+        "filing_activity",
+        {},
+    ) or {}
+
+    charges = report.get(
+        "charges",
+        {},
+    ) or {}
+
+    insolvency = report.get(
+        "insolvency",
+        {},
+    ) or {}
+
+
+    # ========================================================
+    # RESULT HEADER
+    # ========================================================
+
+    company_display = esc(
+        company.get("name") or "Company"
     )
 
-    return {
+    number_display = esc(
+        company.get("number") or "N/A"
+    )
 
-        "agent_result":
-            str(result),
+    st.html(
+        f"""
+        <div style="
+            margin-top:28px;
+            margin-bottom:14px;
+            padding:18px 20px;
+            border:1px solid #dfe6ef;
+            border-radius:16px;
+            background:#ffffff;
+            box-shadow:0 8px 24px rgba(15,23,42,0.045);
+        ">
 
-        "report":
-            build_corporate_xray_report(),
+            <div style="
+                color:#4f46e5;
+                font-size:10px;
+                font-weight:900;
+                letter-spacing:1.7px;
+            ">
+                INVESTIGATION RESULT
+            </div>
 
-        "state":
-            corporate_xray_state.copy(),
+            <div style="
+                margin-top:5px;
+                color:#0f172a;
+                font-size:21px;
+                font-weight:950;
+            ">
+                {company_display}
+            </div>
 
-        "evidence":
-            list(
-                corporate_xray_evidence
-            ),
-    }
+            <div style="
+                margin-top:3px;
+                color:#64748b;
+                font-size:11px;
+            ">
+                Companies House number: {number_display}
+            </div>
+
+        </div>
+        """
+    )
+
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    metric_cols = st.columns(5)
+
+    metric_values = [
+        (
+            "STATUS",
+            company.get("status") or "N/A",
+        ),
+        (
+            "OFFICERS",
+            management.get(
+                "total_officers"
+            ) or 0,
+        ),
+        (
+            "PSC",
+            ownership.get(
+                "psc_count"
+            ) or 0,
+        ),
+        (
+            "FILINGS",
+            filing_activity.get(
+                "total_filings"
+            ) or 0,
+        ),
+        (
+            "CHARGES",
+            charges.get(
+                "total_charges"
+            ) or 0,
+        ),
+    ]
+
+    for col, (label, value) in zip(
+        metric_cols,
+        metric_values,
+    ):
+
+        with col:
+
+            st.html(
+                f"""
+                <div style="
+                    min-height:96px;
+                    padding:15px;
+                    border:1px solid #e2e8f0;
+                    border-radius:15px;
+                    background:#ffffff;
+                    box-shadow:0 7px 22px rgba(15,23,42,0.04);
+                ">
+
+                    <div style="
+                        color:#64748b;
+                        font-size:9px;
+                        font-weight:900;
+                        letter-spacing:1.1px;
+                    ">
+                        {esc(label)}
+                    </div>
+
+                    <div style="
+                        margin-top:7px;
+                        color:#0f172a;
+                        font-size:19px;
+                        font-weight:950;
+                    ">
+                        {esc(value)}
+                    </div>
+
+                </div>
+                """
+            )
+
+
+    # ========================================================
+    # TABS
+    # ========================================================
+
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Management",
+            "Ownership",
+            "Filings",
+            "Charges",
+            "Insolvency",
+            "Evidence",
+        ]
+    )
+
+
+    # ========================================================
+    # OVERVIEW
+    # ========================================================
+
+    with tabs[0]:
+
+        left, right = st.columns(
+            2,
+            gap="medium",
+        )
+
+        with left:
+
+            st.html(
+                """
+                <div style="
+                    padding:18px;
+                    border:1px solid #e2e8f0;
+                    border-radius:15px;
+                    background:#ffffff;
+                ">
+
+                    <div style="
+                        color:#0f172a;
+                        font-size:15px;
+                        font-weight:900;
+                    ">
+                        Company identity
+                    </div>
+
+                    <div style="
+                        margin-top:4px;
+                        color:#64748b;
+                        font-size:11px;
+                    ">
+                        Core legal information.
+                    </div>
+
+                </div>
+                """
+            )
+
+            rows = [
+                (
+                    "Legal name",
+                    company.get("name") or "N/A",
+                ),
+                (
+                    "Company number",
+                    company.get("number") or "N/A",
+                ),
+                (
+                    "Status",
+                    company.get("status") or "N/A",
+                ),
+                (
+                    "Type",
+                    company.get("type") or "N/A",
+                ),
+                (
+                    "Created",
+                    company.get("created") or "N/A",
+                ),
+                (
+                    "Jurisdiction",
+                    company.get("jurisdiction") or "N/A",
+                ),
+                (
+                    "SIC codes",
+                    ", ".join(
+                        str(x)
+                        for x in (
+                            company.get(
+                                "sic_codes"
+                            )
+                            or []
+                        )
+                    ) or "N/A",
+                ),
+            ]
+
+            for label, value in rows:
+
+                st.html(
+                    f"""
+                    <div style="
+                        display:flex;
+                        justify-content:space-between;
+                        gap:20px;
+                        padding:10px 0;
+                        border-bottom:1px solid #f1f5f9;
+                    ">
+
+                        <span style="
+                            color:#64748b;
+                            font-size:11px;
+                        ">
+                            {esc(label)}
+                        </span>
+
+                        <strong style="
+                            color:#0f172a;
+                            font-size:11px;
+                            text-align:right;
+                        ">
+                            {esc(value)}
+                        </strong>
+
+                    </div>
+                    """
+                )
+
+
+        with right:
+
+            st.html(
+                """
+                <div style="
+                    padding:18px;
+                    border:1px solid #e2e8f0;
+                    border-radius:15px;
+                    background:#ffffff;
+                ">
+
+                    <div style="
+                        color:#0f172a;
+                        font-size:15px;
+                        font-weight:900;
+                    ">
+                        Investigation pipeline
+                    </div>
+
+                    <div style="
+                        margin-top:4px;
+                        color:#64748b;
+                        font-size:11px;
+                    ">
+                        Autonomous execution status.
+                    </div>
+
+                </div>
+                """
+            )
+
+            stages = [
+                (
+                    "Company search",
+                    "company_search_completed",
+                ),
+                (
+                    "Company profile",
+                    "company_profile_completed",
+                ),
+                (
+                    "Officers",
+                    "officers_completed",
+                ),
+                (
+                    "PSC / ownership",
+                    "pscs_completed",
+                ),
+                (
+                    "Filing history",
+                    "filings_completed",
+                ),
+                (
+                    "Charges",
+                    "charges_completed",
+                ),
+                (
+                    "Insolvency",
+                    "insolvency_completed",
+                ),
+                (
+                    "Documentary evidence",
+                    "evidence_completed",
+                ),
+            ]
+
+            for label, key in stages:
+
+                completed = bool(
+                    state.get(
+                        key,
+                        False,
+                    )
+                )
+
+                icon = "✓" if completed else "○"
+
+                st.html(
+                    f"""
+                    <div style="
+                        display:flex;
+                        align-items:center;
+                        gap:9px;
+                        padding:8px 0;
+                        border-bottom:1px solid #f1f5f9;
+                    ">
+
+                        <div style="
+                            width:23px;
+                            height:23px;
+                            display:flex;
+                            align-items:center;
+                            justify-content:center;
+                            border-radius:7px;
+                            background:#ecfdf5;
+                            color:#047857;
+                            font-size:11px;
+                            font-weight:900;
+                        ">
+                            {icon}
+                        </div>
+
+                        <div style="
+                            color:#334155;
+                            font-size:11px;
+                            font-weight:750;
+                        ">
+                            {esc(label)}
+                        </div>
+
+                    </div>
+                    """
+                )
+
+
+    # ========================================================
+    # MANAGEMENT
+    # ========================================================
+
+    with tabs[1]:
+
+        st.markdown("### Management activity")
+
+        appointments = safe_list(
+            management.get(
+                "recent_appointments",
+                [],
+            )
+        )
+
+        resignations = safe_list(
+            management.get(
+                "recent_resignations",
+                [],
+            )
+        )
+
+        if appointments:
+
+            for item in appointments:
+
+                st.html(
+                    f"""
+                    <div style="
+                        margin-bottom:10px;
+                        padding:15px;
+                        border:1px solid #e2e8f0;
+                        border-radius:14px;
+                        background:#ffffff;
+                    ">
+
+                        <div style="
+                            color:#0f172a;
+                            font-size:13px;
+                            font-weight:900;
+                        ">
+                            {esc(item.get("name") or "Unknown")}
+                        </div>
+
+                        <div style="
+                            margin-top:4px;
+                            color:#64748b;
+                            font-size:11px;
+                        ">
+                            {esc(item.get("role") or "Role unavailable")}
+                            · Appointed
+                            {esc(item.get("appointed_on") or "N/A")}
+                        </div>
+
+                    </div>
+                    """
+                )
+
+        else:
+
+            st.info(
+                "No appointment records available."
+            )
+
+        if resignations:
+
+            st.markdown("### Recent resignations")
+
+            for item in resignations:
+
+                st.html(
+                    f"""
+                    <div style="
+                        margin-bottom:10px;
+                        padding:15px;
+                        border:1px solid #e2e8f0;
+                        border-radius:14px;
+                        background:#ffffff;
+                    ">
+
+                        <div style="
+                            color:#0f172a;
+                            font-size:13px;
+                            font-weight:900;
+                        ">
+                            {esc(item.get("name") or "Unknown")}
+                        </div>
+
+                        <div style="
+                            margin-top:4px;
+                            color:#64748b;
+                            font-size:11px;
+                        ">
+                            {esc(item.get("role") or "Role unavailable")}
+                            · Resigned
+                            {esc(item.get("resigned_on") or "N/A")}
+                        </div>
+
+                    </div>
+                    """
+                )
+
+
+    # ========================================================
+    # OWNERSHIP
+    # ========================================================
+
+    with tabs[2]:
+
+        st.markdown(
+            "### People with Significant Control"
+        )
+
+        psc_records = safe_list(
+            ownership.get(
+                "psc_records",
+                [],
+            )
+        )
+
+        if psc_records:
+
+            for psc in psc_records:
+
+                controls = safe_list(
+                    psc.get(
+                        "nature_of_control",
+                        [],
+                    )
+                )
+
+                control_text = (
+                    ", ".join(
+                        str(x)
+                        for x in controls
+                    )
+                    if controls
+                    else "Not specified"
+                )
+
+                st.html(
+                    f"""
+                    <div style="
+                        margin-bottom:10px;
+                        padding:15px;
+                        border:1px solid #e2e8f0;
+                        border-radius:14px;
+                        background:#ffffff;
+                    ">
+
+                        <div style="
+                            color:#0f172a;
+                            font-size:13px;
+                            font-weight:900;
+                        ">
+                            {esc(psc.get("name") or "Unknown")}
+                        </div>
+
+                        <div style="
+                            margin-top:4px;
+                            color:#64748b;
+                            font-size:11px;
+                        ">
+                            {esc(psc.get("kind") or "Type unavailable")}
+                        </div>
+
+                        <div style="
+                            margin-top:8px;
+                            color:#334155;
+                            font-size:11px;
+                            line-height:1.6;
+                        ">
+                            <strong>
+                                Nature of control:
+                            </strong>
+                            {esc(control_text)}
+                        </div>
+
+                    </div>
+                    """
+                )
+
+        else:
+
+            st.info(
+                "No PSC records were returned."
+            )
+
+
+    # ========================================================
+    # FILINGS
+    # ========================================================
+
+    with tabs[3]:
+
+        st.markdown(
+            "### Recent filing activity"
+        )
+
+        recent_filings = safe_list(
+            filing_activity.get(
+                "recent_filings",
+                [],
+            )
+        )
+
+        if recent_filings:
+
+            for filing in recent_filings:
+
+                st.html(
+                    f"""
+                    <div style="
+                        margin-bottom:10px;
+                        padding:15px;
+                        border:1px solid #e2e8f0;
+                        border-radius:14px;
+                        background:#ffffff;
+                    ">
+
+                        <div style="
+                            display:flex;
+                            justify-content:space-between;
+                            gap:15px;
+                        ">
+
+                            <strong style="
+                                color:#0f172a;
+                                font-size:12px;
+                            ">
+                                {esc(filing.get("type") or "Filing")}
+                            </strong>
+
+                            <span style="
+                                color:#64748b;
+                                font-size:10px;
+                            ">
+                                {esc(filing.get("date") or "N/A")}
+                            </span>
+
+                        </div>
+
+                        <div style="
+                            margin-top:6px;
+                            color:#475569;
+                            font-size:11px;
+                            line-height:1.5;
+                        ">
+                            {
+                                esc(
+                                    filing.get(
+                                        "description"
+                                    )
+                                    or "No description available."
+                                )
+                            }
+                        </div>
+
+                        <div style="
+                            margin-top:5px;
+                            color:#94a3b8;
+                            font-size:10px;
+                        ">
+                            Category:
+                            {esc(filing.get("category") or "N/A")}
+                        </div>
+
+                    </div>
+                    """
+                )
+
+        else:
+
+            st.info(
+                "No filing records were returned."
+            )
+
+
+    # ========================================================
+    # CHARGES
+    # ========================================================
+
+    with tabs[4]:
+
+        st.markdown("### Registered charges")
+
+        status_counts = (
+            charges.get(
+                "status_counts",
+                {},
+            )
+            or {}
+        )
+
+        if status_counts:
+
+            charge_cols = st.columns(
+                min(
+                    4,
+                    len(status_counts),
+                )
+            )
+
+            for col, (
+                label,
+                value,
+            ) in zip(
+                charge_cols,
+                status_counts.items(),
+            ):
+
+                with col:
+
+                    st.html(
+                        f"""
+                        <div style="
+                            padding:15px;
+                            border:1px solid #e2e8f0;
+                            border-radius:14px;
+                            background:#ffffff;
+                        ">
+
+                            <div style="
+                                color:#64748b;
+                                font-size:9px;
+                                font-weight:900;
+                                text-transform:uppercase;
+                                letter-spacing:1px;
+                            ">
+                                {esc(label)}
+                            </div>
+
+                            <div style="
+                                margin-top:7px;
+                                color:#0f172a;
+                                font-size:20px;
+                                font-weight:950;
+                            ">
+                                {esc(value)}
+                            </div>
+
+                        </div>
+                        """
+                    )
+
+        else:
+
+            st.info(
+                "No charge records were returned."
+            )
+
+
+    # ========================================================
+    # INSOLVENCY
+    # ========================================================
+
+    with tabs[5]:
+
+        st.markdown("### Insolvency information")
+
+        case_count = (
+            insolvency.get(
+                "case_count",
+                0,
+            )
+            or 0
+        )
+
+        if case_count == 0:
+
+            st.success(
+                "No insolvency case records were returned "
+                "for this investigation."
+            )
+
+        else:
+
+            st.warning(
+                f"{case_count} insolvency case record(s) returned."
+            )
+
+
+    # ========================================================
+    # EVIDENCE
+    # ========================================================
+
+    with tabs[6]:
+
+        st.markdown("### Documentary evidence")
+
+        valid_evidence = [
+            item
+            for item in safe_list(evidence)
+            if not item.get("status")
+        ]
+
+        if valid_evidence:
+
+            for item in valid_evidence:
+
+                st.html(
+                    f"""
+                    <div style="
+                        padding:16px;
+                        margin-bottom:10px;
+                        border:1px solid #e2e8f0;
+                        border-left:4px solid #6366f1;
+                        border-radius:12px;
+                        background:#ffffff;
+                    ">
+
+                        <div style="
+                            color:#64748b;
+                            font-size:10px;
+                            font-weight:850;
+                            margin-bottom:7px;
+                        ">
+                            Filing date:
+                            {esc(item.get("filing_date") or "N/A")}
+                            &nbsp; · &nbsp;
+                            Page:
+                            {esc(item.get("page") or "N/A")}
+                            &nbsp; · &nbsp;
+                            Category:
+                            {esc(item.get("category") or "N/A")}
+                        </div>
+
+                        <div style="
+                            color:#334155;
+                            font-size:11px;
+                            line-height:1.65;
+                            white-space:pre-wrap;
+                        ">
+                            {
+                                esc(
+                                    item.get(
+                                        "evidence",
+                                        "No evidence text available.",
+                                    )
+                                )
+                            }
+                        </div>
+
+                    </div>
+                    """
+                )
+
+        else:
+
+            st.info(
+                "No documentary evidence was returned."
+            )
+
+        with st.expander(
+            "Technical investigation output"
+        ):
+
+            st.write(
+                result.get(
+                    "agent_result",
+                    "",
+                )
+            )
 
 
 # ============================================================
-# 40. SYSTEM HEALTH CHECK
+# EMPTY STATE
 # ============================================================
 
-def system_health_check():
+if (
+    result is None
+    and not st.session_state.investigation_error
+):
+
+    st.html(
+        """
+        <div style="
+            margin-top:26px;
+            padding:42px 24px;
+            text-align:center;
+            border:1px solid #e2e8f0;
+            border-radius:16px;
+            background:#ffffff;
+            box-shadow:0 6px 18px rgba(15,23,42,0.035);
+        ">
+
+            <div style="
+                width:48px;
+                height:48px;
+                margin:0 auto 12px;
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                border-radius:14px;
+                background:#eef2ff;
+                color:#4f46e5;
+                font-size:18px;
+                font-weight:900;
+            ">
+                ◈
+            </div>
+
+            <div style="
+                color:#0f172a;
+                font-size:17px;
+                font-weight:900;
+            ">
+                Ready for investigation
+            </div>
+
+            <div style="
+                max-width:700px;
+                margin:8px auto 0;
+                color:#64748b;
+                font-size:11px;
+                line-height:1.7;
+            ">
+                Enter a UK company name above. Corporate X-Ray
+                identifies the company, retrieves official records,
+                analyses management, ownership, filings, charges
+                and insolvency information, and retrieves
+                documentary evidence.
+            </div>
+
+        </div>
+        """
+    )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.html(
     """
-    Return system configuration and runtime health.
+    <div style="
+        margin-top:38px;
+        padding-top:14px;
+        border-top:1px solid #e2e8f0;
+        text-align:center;
+        color:#94a3b8;
+        font-size:10px;
+    ">
+        Corporate X-Ray · 1 AI Agent · 8 Tools ·
+        Companies House · Hybrid RAG · Documentary Evidence
+    </div>
     """
-
-    return {
-
-        "agents":
-            1,
-
-        "tools":
-            len(
-                TOOL_NAMES
-            ),
-
-        "tool_names":
-            list(
-                TOOL_NAMES
-            ),
-
-        "model":
-            (
-                CLOUD_PRIMARY_MODEL_ID
-                if DEPLOYMENT_MODE == "cloud"
-                else MODEL_ID
-            ),
-
-        "fallback_model":
-            (
-                CLOUD_FALLBACK_MODEL_ID
-                if DEPLOYMENT_MODE == "cloud"
-                else None
-            ),
-
-        "embedding_model":
-            EMBEDDING_MODEL_ID,
-
-        "reranker":
-            RERANKER_MODEL_ID,
-
-        "deployment_mode":
-            DEPLOYMENT_MODE,
-
-        "hf_provider":
-            (
-                "nscale -> together (pinned)"
-                if DEPLOYMENT_MODE == "cloud"
-                else HF_PROVIDER
-            ),
-
-        "cuda_available":
-            (
-                __import__("torch").cuda.is_available()
-                if DEPLOYMENT_MODE == "local"
-                else False
-            ),
-
-        "gpu":
-            (
-                __import__("torch").cuda.get_device_name(0)
-                if DEPLOYMENT_MODE == "local"
-                and __import__("torch").cuda.is_available()
-                else "CPU"
-            ),
-    }
-
-
-# ============================================================
-# END OF CORPORATE X-RAY
-# ============================================================
+)
