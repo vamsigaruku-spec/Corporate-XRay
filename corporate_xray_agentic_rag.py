@@ -14,7 +14,7 @@ from smolagents import (
     MessageRole,
     Model,
     ToolCallingAgent,
-    OpenAIModel,
+    InferenceClientModel,
     tool,
 )
 from smolagents.models import get_tool_json_schema
@@ -31,11 +31,12 @@ DOC_API_URL = "https://document-api.company-information.service.gov.uk"
 
 MODEL_ID = os.getenv("CORPORATE_XRAY_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 
-# Cloud inference is pinned to explicit Hugging Face Inference Providers.
-# The legacy CORPORATE_XRAY_HF_PROVIDER setting is intentionally ignored.
-CLOUD_PRIMARY_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507:nscale"
-CLOUD_FALLBACK_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct:together"
-HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
+# Cloud uses Hugging Face automatic provider routing.
+# This avoids pinning the app to a single provider that may be unavailable.
+CLOUD_MODEL_ID = os.getenv(
+    "CORPORATE_XRAY_CLOUD_MODEL_ID",
+    "Qwen/Qwen3-4B-Instruct-2507",
+)
 EMBEDDING_MODEL_ID = os.getenv(
     "CORPORATE_XRAY_EMBEDDING_MODEL_ID",
     "BAAI/bge-small-en-v1.5",
@@ -95,9 +96,9 @@ DEPLOYMENT_MODE = _get_config_value(
     "CORPORATE_XRAY_DEPLOYMENT",
     "local",
 ).lower()
-# Kept only for backwards-compatible health reporting. It is NOT used for
-# cloud model routing, so an old Streamlit secret cannot redirect requests.
-HF_PROVIDER = "pinned"
+# Kept for health reporting. Cloud routing is handled automatically by
+# Hugging Face Inference Providers.
+HF_PROVIDER = "auto"
 
 
 def require_companies_house_api_key():
@@ -2852,101 +2853,8 @@ def load_qwen():
 
 
 # ============================================================
-# 34. RESILIENT CLOUD MODEL + CREATE THE ONE AGENT
+# 34. CREATE THE ONE AGENT
 # ============================================================
-
-class ResilientHFModel(Model):
-    """Retry the pinned primary provider, then use the pinned fallback."""
-
-    def __init__(self, primary, fallback):
-        super().__init__(
-            model_id=(
-                f"{CLOUD_PRIMARY_MODEL_ID} -> "
-                f"{CLOUD_FALLBACK_MODEL_ID}"
-            )
-        )
-        self.primary = primary
-        self.fallback = fallback
-
-    @staticmethod
-    def _is_transient(exc):
-        text = str(exc).lower()
-        status = getattr(exc, "status_code", None)
-        if status is None:
-            response = getattr(exc, "response", None)
-            status = getattr(response, "status_code", None)
-        try:
-            if int(status) in {408, 409, 425, 429, 500, 502, 503, 504}:
-                return True
-        except (TypeError, ValueError):
-            pass
-        return any(
-            marker in text
-            for marker in (
-                "timeout", "timed out", "temporarily unavailable",
-                "service unavailable", "server error", "connection error",
-                "connection reset", "connection aborted", "429", "502",
-                "503", "504", "rate limit", "too many requests",
-            )
-        )
-
-    def _call(self, model, messages, stop_sequences, response_format,
-              tools_to_call_from, kwargs):
-        return model.generate(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            **kwargs,
-        )
-
-    def _try(self, model, label, messages, stop_sequences, response_format,
-             tools_to_call_from, kwargs):
-        last_error = None
-        for attempt in range(2):
-            try:
-                return self._call(
-                    model, messages, stop_sequences, response_format,
-                    tools_to_call_from, kwargs
-                )
-            except Exception as exc:
-                last_error = exc
-                if attempt == 0 and self._is_transient(exc):
-                    time.sleep(2)
-                    continue
-                break
-        raise RuntimeError(f"{label} failed: {last_error}") from last_error
-
-    def generate(
-        self,
-        messages,
-        stop_sequences=None,
-        response_format=None,
-        tools_to_call_from=None,
-        **kwargs,
-    ):
-        try:
-            return self._try(
-                self.primary,
-                "Primary provider (Nscale)",
-                messages, stop_sequences, response_format,
-                tools_to_call_from, kwargs,
-            )
-        except Exception as primary_error:
-            try:
-                return self._try(
-                    self.fallback,
-                    "Fallback provider (Together)",
-                    messages, stop_sequences, response_format,
-                    tools_to_call_from, kwargs,
-                )
-            except Exception as fallback_error:
-                raise RuntimeError(
-                    "Cloud inference failed on both pinned Hugging Face providers. "
-                    f"Primary error: {primary_error}. "
-                    f"Fallback error: {fallback_error}"
-                ) from fallback_error
-
 
 def get_corporate_xray_agent():
     """Build the single Corporate X-Ray agent for local or cloud inference."""
@@ -2961,37 +2869,23 @@ def get_corporate_xray_agent():
                 "HF_TOKEN is required when CORPORATE_XRAY_DEPLOYMENT=cloud."
             )
 
-        # Hugging Face exposes an OpenAI-compatible router at /v1.
-        # The :nscale and :together suffixes pin the provider explicitly.
-        # OpenAIModel is used here deliberately: InferenceClientModel does
-        # not accept a base_url together with its internal model routing in
-        # the installed dependency version, which caused the previous:
-        # "Received both model and base_url arguments" error.
-        primary = OpenAIModel(
-            model_id=CLOUD_PRIMARY_MODEL_ID,
-            api_base=HF_ROUTER_BASE_URL,
-            api_key=HF_TOKEN,
-            temperature=0.0,
+        # Hugging Face InferenceClientModel uses the Hub router.
+        # provider=None means automatic provider selection/failover.
+        # tool_choice="auto" avoids provider-specific "required" incompatibility.
+        model = InferenceClientModel(
+            model_id=CLOUD_MODEL_ID,
+            provider=None,
+            token=HF_TOKEN,
+            timeout=120,
             max_tokens=512,
+            temperature=0.0,
+            tool_choice="auto",
             client_kwargs={
-                "timeout": 120.0,
-                "max_retries": 0,
+                "max_retries": 2,
+                "timeout": 120,
             },
         )
 
-        fallback = OpenAIModel(
-            model_id=CLOUD_FALLBACK_MODEL_ID,
-            api_base=HF_ROUTER_BASE_URL,
-            api_key=HF_TOKEN,
-            temperature=0.0,
-            max_tokens=512,
-            client_kwargs={
-                "timeout": 120.0,
-                "max_retries": 0,
-            },
-        )
-
-        model = ResilientHFModel(primary, fallback)
     elif DEPLOYMENT_MODE == "local":
         model_weights, tokenizer = load_qwen()
         model = LocalQwenModel(
@@ -2999,6 +2893,7 @@ def get_corporate_xray_agent():
             tokenizer=tokenizer,
             max_new_tokens=96,
         )
+
     else:
         raise RuntimeError(
             "CORPORATE_XRAY_DEPLOYMENT must be 'local' or 'cloud'."
@@ -3450,17 +3345,13 @@ def system_health_check():
 
         "model":
             (
-                CLOUD_PRIMARY_MODEL_ID
+                CLOUD_MODEL_ID
                 if DEPLOYMENT_MODE == "cloud"
                 else MODEL_ID
             ),
 
         "fallback_model":
-            (
-                CLOUD_FALLBACK_MODEL_ID
-                if DEPLOYMENT_MODE == "cloud"
-                else None
-            ),
+            None,
 
         "embedding_model":
             EMBEDDING_MODEL_ID,
@@ -3473,7 +3364,7 @@ def system_health_check():
 
         "hf_provider":
             (
-                "nscale -> together (pinned)"
+                "auto"
                 if DEPLOYMENT_MODE == "cloud"
                 else HF_PROVIDER
             ),
