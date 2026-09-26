@@ -1,6 +1,5 @@
 streamlit==1.64.0
 smolagents[openai]==1.26.0
-huggingface_hub>=0.36.0
 openai>=1.100.0
 requests>=2.32.0
 pandas>=2.2.0
