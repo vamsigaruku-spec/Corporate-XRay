@@ -1,9 +1,15 @@
-smolagents[openai]==1.26.0
 streamlit==1.64.0
-openai
+smolagents==1.26.0
+transformers
+accelerate
+bitsandbytes
+huggingface_hub
 requests
 pandas
 numpy
 PyMuPDF
 rank-bm25
 sentence-transformers
+torch
+torchvision
+python-dotenv
