@@ -1,15 +1,9 @@
 streamlit==1.64.0
 smolagents==1.26.0
-transformers
-accelerate
-bitsandbytes
-huggingface_hub
+openai
 requests
 pandas
 numpy
 PyMuPDF
 rank-bm25
 sentence-transformers
-torch
-torchvision
-python-dotenv
