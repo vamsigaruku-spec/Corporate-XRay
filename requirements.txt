@@ -1,8 +1,9 @@
-streamlit
+smolagents[openai]==1.26.0
+streamlit==1.64.0
+openai
 requests
 pandas
 numpy
-scikit-learn
+PyMuPDF
+rank-bm25
 sentence-transformers
-faiss-cpu
-smolagents[openai]
