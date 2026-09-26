@@ -1,5 +1,5 @@
 streamlit==1.64.0
-smolagents==1.26.0
+smolagents[openai]==1.26.0
 huggingface_hub>=0.36.0
 requests>=2.32.0
 pandas>=2.2.0
@@ -7,9 +7,4 @@ numpy>=2.0.0
 PyMuPDF>=1.26.0
 rank-bm25>=0.2.2
 sentence-transformers>=5.0.0
-torch>=2.6.0
-torchvision>=0.21.0
-transformers>=4.51.0
-accelerate>=1.0.0
-bitsandbytes>=0.45.0
 python-dotenv>=1.0.0
