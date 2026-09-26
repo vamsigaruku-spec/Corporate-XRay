@@ -14,10 +14,10 @@ from smolagents import (
     MessageRole,
     Model,
     ToolCallingAgent,
-    OpenAIModel,
     tool,
 )
 from smolagents.models import get_tool_json_schema
+from huggingface_hub import InferenceClient
 
 
 # ============================================================
@@ -33,9 +33,10 @@ MODEL_ID = os.getenv("CORPORATE_XRAY_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 
 # Cloud inference is pinned to explicit Hugging Face Inference Providers.
 # The legacy CORPORATE_XRAY_HF_PROVIDER setting is intentionally ignored.
-CLOUD_PRIMARY_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507:nscale"
-CLOUD_FALLBACK_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct:together"
-HF_ROUTER_BASE_URL = "https://router.huggingface.co/v1"
+CLOUD_PRIMARY_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
+CLOUD_PRIMARY_PROVIDER = "nscale"
+CLOUD_FALLBACK_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+CLOUD_FALLBACK_PROVIDER = "together"
 EMBEDDING_MODEL_ID = os.getenv(
     "CORPORATE_XRAY_EMBEDDING_MODEL_ID",
     "BAAI/bge-small-en-v1.5",
@@ -95,9 +96,8 @@ DEPLOYMENT_MODE = _get_config_value(
     "CORPORATE_XRAY_DEPLOYMENT",
     "local",
 ).lower()
-# Kept only for backwards-compatible health reporting. It is NOT used for
-# cloud model routing, so an old Streamlit secret cannot redirect requests.
-HF_PROVIDER = "pinned"
+# Legacy setting retained only for compatibility; cloud routing is hard-coded.
+HF_PROVIDER = "inference-providers"
 
 
 def require_companies_house_api_key():
@@ -2754,7 +2754,7 @@ def load_qwen():
     if DEPLOYMENT_MODE != "local":
         raise RuntimeError(
             "Local Qwen loading is disabled in cloud mode. "
-            "Use the pinned OpenAI-compatible Hugging Face router for deployed inference."
+            "Use Hugging Face InferenceClient for deployed inference."
         )
 
     tokenizer = (
@@ -2856,24 +2856,33 @@ def load_qwen():
 # ============================================================
 
 class ResilientHFModel(Model):
-    """Retry the pinned primary provider, then use the pinned fallback."""
+    """Hugging Face routed model with explicit tool-calling and failover."""
 
-    def __init__(self, primary, fallback):
+    def __init__(self, primary_model, primary_provider, fallback_model, fallback_provider):
         super().__init__(
-            model_id=(
-                f"{CLOUD_PRIMARY_MODEL_ID} -> "
-                f"{CLOUD_FALLBACK_MODEL_ID}"
-            )
+            model_id=f"{primary_model}:{primary_provider} -> {fallback_model}:{fallback_provider}"
         )
-        self.primary = primary
-        self.fallback = fallback
+        self.primary_model = primary_model
+        self.primary_provider = primary_provider
+        self.fallback_model = fallback_model
+        self.fallback_provider = fallback_provider
+        self.primary_client = InferenceClient(
+            provider=primary_provider,
+            token=HF_TOKEN,
+            timeout=120,
+        )
+        self.fallback_client = InferenceClient(
+            provider=fallback_provider,
+            token=HF_TOKEN,
+            timeout=120,
+        )
 
     @staticmethod
     def _is_transient(exc):
         text = str(exc).lower()
         status = getattr(exc, "status_code", None)
+        response = getattr(exc, "response", None)
         if status is None:
-            response = getattr(exc, "response", None)
             status = getattr(response, "status_code", None)
         try:
             if int(status) in {408, 409, 425, 429, 500, 502, 503, 504}:
@@ -2885,29 +2894,154 @@ class ResilientHFModel(Model):
             for marker in (
                 "timeout", "timed out", "temporarily unavailable",
                 "service unavailable", "server error", "connection error",
-                "connection reset", "connection aborted", "429", "502",
-                "503", "504", "rate limit", "too many requests",
+                "connection reset", "connection aborted", "rate limit",
+                "too many requests", "502", "503", "504",
             )
         )
 
-    def _call(self, model, messages, stop_sequences, response_format,
-              tools_to_call_from, kwargs):
-        return model.generate(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            **kwargs,
+    @staticmethod
+    def _is_tool_choice_error(exc):
+        text = str(exc).lower()
+        return "tool_choice" in text or "invalid_tool_choice" in text
+
+    @staticmethod
+    def _prepare_messages(messages):
+        prepared = []
+        for message in messages:
+            if isinstance(message, ChatMessage):
+                role = message.role.value
+                content = message.content or ""
+            else:
+                role = message.get("role", "user")
+                content = message.get("content", "")
+
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                )
+
+            if role == "tool-response":
+                role = "user"
+                content = f"<tool_response>\n{str(content)[-2400:]}\n</tool_response>"
+            elif role == "tool-call":
+                role = "assistant"
+
+            prepared.append({
+                "role": role,
+                "content": str(content)[-2400:],
+            })
+        return prepared
+
+    @staticmethod
+    def _allowed_tool_names(stage):
+        return {stage, "final_answer"} if stage == "search_company_evidence" else {stage}
+
+    @staticmethod
+    def _parse_tool_result(response, allowed_names, stage, fallback_text):
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+
+        for call in tool_calls:
+            function = getattr(call, "function", None)
+            name = getattr(function, "name", None)
+            arguments = getattr(function, "arguments", {})
+            if not name or name not in allowed_names:
+                continue
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            return name, arguments
+
+        content = getattr(message, "content", None) or fallback_text or ""
+        return None, {"_content": str(content)}
+
+    def _request(self, client, model_id, messages, tools, max_tokens=512):
+        kwargs = {
+            "model": model_id,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # Some providers accept only auto/none. If they reject the
+            # tool-choice field, retry once with none; the stage-aware parser
+            # below will safely select the only permitted tool.
+            if self._is_tool_choice_error(exc):
+                kwargs["tool_choice"] = "none"
+                return client.chat.completions.create(**kwargs)
+            raise
+
+    def _generate_from_provider(self, client, model_id, provider, messages,
+                                tools_to_call_from, kwargs):
+        stage = corporate_xray_state["current_stage"]
+        allowed_names = self._allowed_tool_names(stage)
+        allowed_tools = [
+            tool_obj for tool_obj in (tools_to_call_from or [])
+            if tool_obj.name in allowed_names
+        ]
+        tool_schemas = [get_tool_json_schema(tool_obj) for tool_obj in allowed_tools]
+        prepared = self._prepare_messages(messages)
+        response = self._request(
+            client,
+            model_id,
+            prepared,
+            tool_schemas,
+            max_tokens=int(kwargs.get("max_tokens", 512)),
+        )
+        name, arguments = self._parse_tool_result(
+            response,
+            allowed_names,
+            stage,
+            "",
         )
 
-    def _try(self, model, label, messages, stop_sequences, response_format,
-             tools_to_call_from, kwargs):
+        if name is None:
+            generated_text = arguments.get("_content", "").strip()
+            if stage == "final_answer":
+                name = "final_answer"
+                arguments = {"answer": generated_text or "Investigation completed."}
+            elif stage == "search_company_evidence":
+                name = "search_company_evidence"
+                arguments = {
+                    "query": corporate_xray_state.get("default_evidence_query", "")
+                }
+            elif stage == "company_search":
+                name = "company_search"
+                arguments = {
+                    "query": corporate_xray_state.get("investigation_question", "")
+                }
+            else:
+                name = stage
+                arguments = {}
+
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=(
+                "<tool_call>\n"
+                + json.dumps(
+                    {"name": name, "arguments": arguments},
+                    ensure_ascii=False,
+                )
+                + "\n</tool_call>"
+            ),
+        )
+
+    def _attempt(self, client, model_id, provider, messages, tools_to_call_from, kwargs):
         last_error = None
         for attempt in range(2):
             try:
-                return self._call(
-                    model, messages, stop_sequences, response_format,
-                    tools_to_call_from, kwargs
+                return self._generate_from_provider(
+                    client, model_id, provider, messages, tools_to_call_from, kwargs
                 )
             except Exception as exc:
                 last_error = exc
@@ -2915,7 +3049,7 @@ class ResilientHFModel(Model):
                     time.sleep(2)
                     continue
                 break
-        raise RuntimeError(f"{label} failed: {last_error}") from last_error
+        raise RuntimeError(f"{provider} failed: {last_error}") from last_error
 
     def generate(
         self,
@@ -2926,25 +3060,29 @@ class ResilientHFModel(Model):
         **kwargs,
     ):
         try:
-            return self._try(
-                self.primary,
-                "Primary provider (Nscale)",
-                messages, stop_sequences, response_format,
-                tools_to_call_from, kwargs,
+            return self._attempt(
+                self.primary_client,
+                self.primary_model,
+                self.primary_provider,
+                messages,
+                tools_to_call_from,
+                kwargs,
             )
         except Exception as primary_error:
             try:
-                return self._try(
-                    self.fallback,
-                    "Fallback provider (Together)",
-                    messages, stop_sequences, response_format,
-                    tools_to_call_from, kwargs,
+                return self._attempt(
+                    self.fallback_client,
+                    self.fallback_model,
+                    self.fallback_provider,
+                    messages,
+                    tools_to_call_from,
+                    kwargs,
                 )
             except Exception as fallback_error:
                 raise RuntimeError(
-                    "Cloud inference failed on both pinned Hugging Face providers. "
-                    f"Primary error: {primary_error}. "
-                    f"Fallback error: {fallback_error}"
+                    "Cloud inference failed on both Hugging Face provider routes. "
+                    f"Primary ({self.primary_provider}) error: {primary_error}. "
+                    f"Fallback ({self.fallback_provider}) error: {fallback_error}"
                 ) from fallback_error
 
 
@@ -2961,35 +3099,12 @@ def get_corporate_xray_agent():
                 "HF_TOKEN is required when CORPORATE_XRAY_DEPLOYMENT=cloud."
             )
 
-        # Hugging Face exposes an OpenAI-compatible router at /v1.
-        # The :nscale and :together suffixes pin the provider explicitly.
-        # OpenAIModel is used here deliberately: InferenceClientModel does
-        # not accept a base_url together with its internal model routing in
-        # the installed dependency version, which caused the previous:
-        # "Received both model and base_url arguments" error.
-        primary = OpenAIModel(
-            model_id=CLOUD_PRIMARY_MODEL_ID,
-            api_base=HF_ROUTER_BASE_URL,
-            api_key=HF_TOKEN,
-            temperature=0.0,
-            max_tokens=512,
-            client_kwargs={
-                "timeout": 120.0,
-            },
+        model = ResilientHFModel(
+            CLOUD_PRIMARY_MODEL_ID,
+            CLOUD_PRIMARY_PROVIDER,
+            CLOUD_FALLBACK_MODEL_ID,
+            CLOUD_FALLBACK_PROVIDER,
         )
-
-        fallback = OpenAIModel(
-            model_id=CLOUD_FALLBACK_MODEL_ID,
-            api_base=HF_ROUTER_BASE_URL,
-            api_key=HF_TOKEN,
-            temperature=0.0,
-            max_tokens=512,
-            client_kwargs={
-                "timeout": 120.0,
-            },
-        )
-
-        model = ResilientHFModel(primary, fallback)
     elif DEPLOYMENT_MODE == "local":
         model_weights, tokenizer = load_qwen()
         model = LocalQwenModel(
@@ -3471,7 +3586,7 @@ def system_health_check():
 
         "hf_provider":
             (
-                "nscale -> together (pinned)"
+                "nscale -> together (explicit failover)"
                 if DEPLOYMENT_MODE == "cloud"
                 else HF_PROVIDER
             ),
